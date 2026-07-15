@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  simulator:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./certs:/app/certs
+    environment:
+      - LOG_LEVEL=info
+    restart: unless-stopped

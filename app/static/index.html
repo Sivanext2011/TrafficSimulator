@@ -1,0 +1,940 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telecom Traffic Simulator</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg-primary: #1a1a2e;
+            --bg-secondary: #16213e;
+            --bg-card: #0f3460;
+            --accent: #e94560;
+            --text-primary: #eaeaea;
+            --text-secondary: #a0a0b0;
+            --success: #4caf50;
+            --error: #f44336;
+            --warning: #ff9800;
+            --border-radius: 10px;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+        header {
+            background: var(--bg-secondary);
+            padding: 1rem 2rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+        header h1 {
+            font-size: 1.5rem;
+            color: var(--accent);
+            white-space: nowrap;
+        }
+        .protocol-tabs {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+        .protocol-tabs button {
+            padding: 0.5rem 1.2rem;
+            border: 1px solid var(--bg-card);
+            background: var(--bg-card);
+            color: var(--text-secondary);
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        .protocol-tabs button.active,
+        .protocol-tabs button:hover {
+            background: var(--accent);
+            color: #fff;
+            border-color: var(--accent);
+        }
+        .main-grid {
+            display: grid;
+            grid-template-columns: 380px 1fr;
+            grid-template-rows: 1fr auto;
+            gap: 1.2rem;
+            padding: 1.2rem;
+            max-height: calc(100vh - 70px);
+            overflow: hidden;
+        }
+        @media (max-width: 1024px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+                max-height: unset;
+                overflow: auto;
+            }
+        }
+        .card {
+            background: var(--bg-secondary);
+            border-radius: var(--border-radius);
+            padding: 1.2rem;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        }
+        .card h3 {
+            color: var(--accent);
+            margin-bottom: 0.8rem;
+            font-size: 0.95rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .config-panel {
+            overflow-y: auto;
+            max-height: calc(100vh - 90px);
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+        .config-panel::-webkit-scrollbar { width: 6px; }
+        .config-panel::-webkit-scrollbar-thumb { background: var(--bg-card); border-radius: 3px; }
+        .form-group { margin-bottom: 0.7rem; }
+        .form-group label {
+            display: block;
+            font-size: 0.78rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.3rem;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 0.5rem 0.7rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--bg-card);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.85rem;
+            transition: border-color 0.2s;
+        }
+        .form-group input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.5rem;
+        }
+        .form-row-3 {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 0.5rem;
+        }
+        .btn {
+            padding: 0.6rem 1.2rem;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.85rem;
+            transition: all 0.2s;
+        }
+        .btn-start {
+            background: var(--success);
+            color: #fff;
+            flex: 1;
+        }
+        .btn-start:hover { background: #388e3c; }
+        .btn-stop {
+            background: var(--error);
+            color: #fff;
+            flex: 1;
+        }
+        .btn-stop:hover { background: #c62828; }
+        .btn-upload {
+            background: var(--accent);
+            color: #fff;
+            width: 100%;
+            margin-top: 0.5rem;
+        }
+        .btn-upload:hover { opacity: 0.85; }
+        .btn-group {
+            display: flex;
+            gap: 0.7rem;
+            margin-top: 0.5rem;
+        }
+        .speed-slider-container {
+            display: flex;
+            align-items: center;
+            gap: 0.8rem;
+        }
+        .speed-slider-container input[type="range"] {
+            flex: 1;
+            accent-color: var(--accent);
+        }
+        .speed-value {
+            min-width: 70px;
+            text-align: center;
+            font-weight: bold;
+            color: var(--accent);
+            font-size: 1rem;
+        }
+        .metrics-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            overflow-y: auto;
+            max-height: calc(100vh - 90px);
+        }
+        .metrics-panel::-webkit-scrollbar { width: 6px; }
+        .metrics-panel::-webkit-scrollbar-thumb { background: var(--bg-card); border-radius: 3px; }
+        .counters-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            gap: 0.8rem;
+        }
+        .counter-card {
+            background: var(--bg-card);
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+        }
+        .counter-card .value {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: var(--text-primary);
+        }
+        .counter-card .label {
+            font-size: 0.72rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            margin-top: 0.3rem;
+            letter-spacing: 0.3px;
+        }
+        .counter-card.success .value { color: var(--success); }
+        .counter-card.error .value { color: var(--error); }
+        .counter-card.accent .value { color: var(--accent); }
+        .status-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.4rem 1rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .status-indicator .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .status-idle { background: var(--bg-card); }
+        .status-idle .dot { background: var(--text-secondary); }
+        .status-running { background: rgba(76,175,80,0.15); }
+        .status-running .dot { background: var(--success); }
+        .status-completed { background: rgba(33,150,243,0.15); }
+        .status-completed .dot { background: #2196f3; }
+        .status-error { background: rgba(244,67,54,0.15); }
+        .status-error .dot { background: var(--error); }
+        .charts-container {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 1rem;
+        }
+        @media (max-width: 1200px) {
+            .charts-container { grid-template-columns: 1fr; }
+        }
+        .chart-wrapper {
+            background: var(--bg-card);
+            border-radius: 8px;
+            padding: 1rem;
+            position: relative;
+            height: 220px;
+        }
+        .chart-wrapper canvas { width: 100% !important; height: 100% !important; }
+        .log-panel {
+            grid-column: 1 / -1;
+            max-height: 200px;
+        }
+        .log-entries {
+            max-height: 140px;
+            overflow-y: auto;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 0.78rem;
+            line-height: 1.6;
+        }
+        .log-entries::-webkit-scrollbar { width: 5px; }
+        .log-entries::-webkit-scrollbar-thumb { background: var(--bg-card); border-radius: 3px; }
+        .log-entry {
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            display: flex;
+            gap: 1rem;
+            border-bottom: 1px solid rgba(255,255,255,0.03);
+        }
+        .log-entry:hover { background: rgba(255,255,255,0.03); }
+        .log-entry .ts { color: var(--text-secondary); min-width: 80px; }
+        .log-entry .proto { color: var(--accent); min-width: 60px; font-weight: 600; }
+        .log-entry .action { color: var(--text-primary); min-width: 80px; }
+        .log-entry .status-ok { color: var(--success); }
+        .log-entry .status-err { color: var(--error); }
+        .log-entry .latency { color: var(--text-secondary); margin-left: auto; }
+        .diameter-fields { display: none; }
+        .diameter-fields.visible { display: block; }
+        input[type="file"] {
+            font-size: 0.78rem;
+            color: var(--text-secondary);
+        }
+        input[type="file"]::file-selector-button {
+            background: var(--bg-card);
+            border: 1px solid var(--accent);
+            color: var(--text-primary);
+            padding: 0.3rem 0.7rem;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 0.5rem;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>&#128225; Telecom Traffic Simulator</h1>
+        <div class="protocol-tabs" id="protocolTabs">
+            <button class="active" data-protocol="chf">CHF</button>
+            <button data-protocol="pcf">PCF</button>
+            <button data-protocol="gy">Gy</button>
+            <button data-protocol="sy">Sy</button>
+            <button data-protocol="ro">Ro</button>
+            <button data-protocol="scapv2">SCAPv2</button>
+        </div>
+    </header>
+
+
+    <div class="main-grid">
+        <!-- CONFIG PANEL -->
+        <div class="config-panel">
+            <div class="card">
+                <h3>Endpoint</h3>
+                <div class="form-group">
+                    <label>FQDN</label>
+                    <input type="text" id="fqdn" placeholder="e.g. chf.example.com">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Port</label>
+                        <input type="number" id="port" placeholder="443">
+                    </div>
+                    <div class="form-group">
+                        <label>Base Path</label>
+                        <input type="text" id="basePath" placeholder="/nchf-convergedcharging/v3">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label><input type="checkbox" id="secure" checked> HTTPS (TLS)</label>
+                    </div>
+                    <div class="form-group">
+                        <label><input type="checkbox" id="verifySsl"> Verify SSL</label>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Diameter-specific fields -->
+            <div class="card diameter-fields" id="diameterFields">
+                <h3>Diameter Connection</h3>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Diameter Host (IP/FQDN)</label>
+                        <input type="text" id="diameterHost" placeholder="10.0.0.1">
+                    </div>
+                    <div class="form-group">
+                        <label>Diameter Port</label>
+                        <input type="number" id="diameterPort" value="3868">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Origin-Host</label>
+                        <input type="text" id="originHost" placeholder="telecom-simulator.local">
+                    </div>
+                    <div class="form-group">
+                        <label>Origin-Realm</label>
+                        <input type="text" id="originRealm" placeholder="simulator.local">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Destination-Host</label>
+                        <input type="text" id="destinationHost" placeholder="ocs.operator.com">
+                    </div>
+                    <div class="form-group">
+                        <label>Destination-Realm</label>
+                        <input type="text" id="destinationRealm" placeholder="operator.com">
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Certificates</h3>
+                <div class="form-group">
+                    <label>Client Certificate (.crt)</label>
+                    <input type="file" id="clientCert" accept=".crt,.pem">
+                </div>
+                <div class="form-group">
+                    <label>Client Key (.key)</label>
+                    <input type="file" id="clientKey" accept=".key,.pem">
+                </div>
+                <div class="form-group">
+                    <label>CA Certificate (.crt)</label>
+                    <input type="file" id="caCert" accept=".crt,.pem">
+                </div>
+                <button class="btn btn-upload" onclick="uploadCerts()">Upload Certificates</button>
+            </div>
+
+            <div class="card">
+                <h3>Subscriber</h3>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>MSISDN</label>
+                        <input type="text" id="msisdn" placeholder="14155551234">
+                    </div>
+                    <div class="form-group">
+                        <label>IMSI</label>
+                        <input type="text" id="imsi" placeholder="310260000000001">
+                    </div>
+                </div>
+                <div class="form-row-3">
+                    <div class="form-group">
+                        <label>Slice SST</label>
+                        <input type="number" id="sliceSST" placeholder="1">
+                    </div>
+                    <div class="form-group">
+                        <label>Slice SD</label>
+                        <input type="text" id="sliceSD" placeholder="000001">
+                    </div>
+                    <div class="form-group">
+                        <label>DNN</label>
+                        <input type="text" id="dnn" placeholder="internet">
+                    </div>
+                </div>
+                <div class="form-row-3">
+                    <div class="form-group">
+                        <label>APN</label>
+                        <input type="text" id="apn" placeholder="internet">
+                    </div>
+                    <div class="form-group">
+                        <label>MCC</label>
+                        <input type="text" id="mcc" placeholder="310">
+                    </div>
+                    <div class="form-group">
+                        <label>MNC</label>
+                        <input type="text" id="mnc" placeholder="260">
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Traffic</h3>
+                <div class="form-group">
+                    <label>Download Speed (Mbps)</label>
+                    <div class="speed-slider-container">
+                        <input type="range" id="speedSlider" min="0" max="11" step="1" value="5">
+                        <span class="speed-value" id="speedDisplay">10</span>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Rating Groups (comma-separated)</label>
+                    <input type="text" id="ratingGroups" placeholder="1000,2000,3000" value="1000">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Session Duration (sec)</label>
+                        <input type="number" id="sessionDuration" placeholder="300" value="300">
+                    </div>
+                    <div class="form-group">
+                        <label>Number of Sessions</label>
+                        <input type="number" id="numSessions" placeholder="1" value="1">
+                    </div>
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-start" onclick="startTraffic()">&#9654; Start</button>
+                    <button class="btn btn-stop" onclick="stopTraffic()">&#9632; Stop</button>
+                </div>
+            </div>
+        </div>
+
+
+        <!-- METRICS PANEL -->
+        <div class="metrics-panel">
+            <div class="card">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+                    <h3 style="margin-bottom:0;">Live Metrics</h3>
+                    <div class="status-indicator status-idle" id="statusIndicator">
+                        <span class="dot"></span>
+                        <span id="statusText">IDLE</span>
+                    </div>
+                </div>
+                <div class="counters-grid">
+                    <div class="counter-card accent">
+                        <div class="value" id="metricSpeed">10</div>
+                        <div class="label">Speed (Mbps)</div>
+                    </div>
+                    <div class="counter-card">
+                        <div class="value" id="metricVolume">0.0</div>
+                        <div class="label">Total Volume (MB)</div>
+                    </div>
+                    <div class="counter-card">
+                        <div class="value" id="metricTotal">0</div>
+                        <div class="label">Total Requests</div>
+                    </div>
+                    <div class="counter-card success">
+                        <div class="value" id="metricSuccess">0</div>
+                        <div class="label">Successful</div>
+                    </div>
+                    <div class="counter-card error">
+                        <div class="value" id="metricFailed">0</div>
+                        <div class="label">Failed</div>
+                    </div>
+                    <div class="counter-card">
+                        <div class="value" id="metricSessions">0</div>
+                        <div class="label">Active Sessions</div>
+                    </div>
+                    <div class="counter-card accent">
+                        <div class="value" id="metricTPS">0.0</div>
+                        <div class="label">Current TPS</div>
+                    </div>
+                    <div class="counter-card">
+                        <div class="value" id="metricLatency">0</div>
+                        <div class="label">Avg Latency (ms)</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Performance Charts</h3>
+                <div class="charts-container">
+                    <div class="chart-wrapper">
+                        <canvas id="tpsChart"></canvas>
+                    </div>
+                    <div class="chart-wrapper">
+                        <canvas id="responseChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- LOG PANEL -->
+        <div class="card log-panel">
+            <h3>Request Log</h3>
+            <div class="log-entries" id="logEntries">
+                <div class="log-entry">
+                    <span class="ts">--:--:--</span>
+                    <span class="proto">SYS</span>
+                    <span class="action">Ready</span>
+                    <span class="status-ok">Waiting for traffic start...</span>
+                    <span class="latency"></span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ─── State ───────────────────────────────────────────────────────────────
+        let selectedProtocol = 'chf';
+        let ws = null;
+        let tpsChart = null;
+        let responseChart = null;
+        let tpsData = [];
+        let latencyData = [];
+        let timeLabels = [];
+        let responseCodes = {};
+
+        // Speed steps for logarithmic-feel slider
+        const speedSteps = [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
+        const diameterProtocols = ['gy', 'ro', 'sy'];
+        const sbiProtocols = ['chf', 'pcf', 'scapv2'];
+
+        // ─── Protocol Tabs ───────────────────────────────────────────────────────
+        document.getElementById('protocolTabs').addEventListener('click', (e) => {
+            if (e.target.tagName === 'BUTTON') {
+                document.querySelectorAll('.protocol-tabs button').forEach(b => b.classList.remove('active'));
+                e.target.classList.add('active');
+                selectedProtocol = e.target.dataset.protocol;
+                toggleDiameterFields();
+                updateDefaultsForProtocol();
+            }
+        });
+
+        function updateDefaultsForProtocol() {
+            const basePathEl = document.getElementById('basePath');
+            const portEl = document.getElementById('port');
+            const defaults = {
+                'chf': { path: '/nchf-convergedcharging/v3', port: '80' },
+                'pcf': { path: '/npcf-smpolicycontrol/v1', port: '80' },
+                'scapv2': { path: '/scapv2/charging/v1', port: '80' },
+                'gy': { path: '', port: '3868' },
+                'ro': { path: '', port: '3868' },
+                'sy': { path: '', port: '3868' },
+            };
+            const d = defaults[selectedProtocol] || defaults['chf'];
+            basePathEl.placeholder = d.path;
+            if (!basePathEl.value || Object.values(defaults).some(x => x.path === basePathEl.value)) {
+                basePathEl.value = d.path;
+            }
+            if (!portEl.value || ['80', '443', '3868'].includes(portEl.value)) {
+                portEl.value = d.port;
+            }
+        }
+
+        function toggleDiameterFields() {
+            const diameterSection = document.getElementById('diameterFields');
+            if (diameterProtocols.includes(selectedProtocol)) {
+                diameterSection.classList.add('visible');
+            } else {
+                diameterSection.classList.remove('visible');
+            }
+        }
+
+        // ─── Speed Slider (logarithmic steps) ────────────────────────────────────
+        const speedSlider = document.getElementById('speedSlider');
+        const speedDisplay = document.getElementById('speedDisplay');
+
+        function getSpeedFromSlider() {
+            return speedSteps[parseInt(speedSlider.value)];
+        }
+
+        function updateSpeedDisplay() {
+            const speed = getSpeedFromSlider();
+            speedDisplay.textContent = speed >= 1 ? speed : speed.toFixed(1);
+        }
+
+        speedSlider.addEventListener('input', updateSpeedDisplay);
+
+        // Debounced POST to /api/traffic/speed on change
+        let speedDebounceTimer = null;
+        speedSlider.addEventListener('change', () => {
+            const speed = getSpeedFromSlider();
+            if (speedDebounceTimer) clearTimeout(speedDebounceTimer);
+            speedDebounceTimer = setTimeout(() => {
+                fetch('/api/traffic/speed', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ speed_mbps: speed })
+                }).then(r => r.json())
+                  .then(() => addLog('SYS', 'Speed', 'ok', `Speed set to ${speed} Mbps`))
+                  .catch(err => addLog('SYS', 'Speed', 'error', err.message));
+            }, 300);
+        });
+
+        // Initialize display
+        updateSpeedDisplay();
+
+        // ─── Upload Certificates ─────────────────────────────────────────────────
+        function uploadCerts() {
+            const formData = new FormData();
+            const clientCert = document.getElementById('clientCert').files[0];
+            const clientKey = document.getElementById('clientKey').files[0];
+            const caCert = document.getElementById('caCert').files[0];
+
+            if (clientCert) formData.append('client_cert', clientCert);
+            if (clientKey) formData.append('client_key', clientKey);
+            if (caCert) formData.append('ca_cert', caCert);
+
+            if (!clientCert && !clientKey && !caCert) {
+                addLog('SYS', 'Upload', 'error', 'No files selected');
+                return;
+            }
+
+            fetch('/api/certs/upload', { method: 'POST', body: formData })
+                .then(r => r.json())
+                .then(data => {
+                    addLog('SYS', 'Upload', data.status || 'ok', 'Certificates uploaded');
+                })
+                .catch(err => addLog('SYS', 'Upload', 'error', err.message));
+        }
+
+
+        // ─── Start Traffic ────────────────────────────────────────────────────────
+        function startTraffic() {
+            const speed = getSpeedFromSlider();
+            const ratingGroupsStr = document.getElementById('ratingGroups').value || '1000';
+            const ratingGroups = ratingGroupsStr.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+
+            const config = {
+                protocol: selectedProtocol,
+                endpoint: {
+                    protocol: selectedProtocol,
+                    fqdn: document.getElementById('fqdn').value || 'localhost',
+                    port: parseInt(document.getElementById('port').value) || 443,
+                    base_path: document.getElementById('basePath').value || null,
+                    secure: document.getElementById('secure').checked,
+                    verify_ssl: document.getElementById('verifySsl').checked
+                },
+                subscriber: {
+                    msisdn: document.getElementById('msisdn').value || '886912345678',
+                    imsi: document.getElementById('imsi').value || '466010000000001',
+                    rating_group: ratingGroups[0] || 1000,
+                    slice_sst: parseInt(document.getElementById('sliceSST').value) || 1,
+                    slice_sd: document.getElementById('sliceSD').value || '000001',
+                    dnn: document.getElementById('dnn').value || 'internet',
+                    apn: document.getElementById('apn').value || 'internet',
+                    mcc: document.getElementById('mcc').value || '466',
+                    mnc: document.getElementById('mnc').value || '01'
+                },
+                speed_mbps: speed,
+                rating_groups: ratingGroups,
+                session_duration_sec: parseInt(document.getElementById('sessionDuration').value) || 300,
+                num_sessions: parseInt(document.getElementById('numSessions').value) || 1
+            };
+
+            // Add diameter fields if diameter protocol selected
+            if (diameterProtocols.includes(selectedProtocol)) {
+                config.diameter_host = document.getElementById('diameterHost').value || null;
+                config.diameter_port = parseInt(document.getElementById('diameterPort').value) || 3868;
+                config.origin_host = document.getElementById('originHost').value || null;
+                config.origin_realm = document.getElementById('originRealm').value || null;
+                config.destination_host = document.getElementById('destinationHost').value || null;
+                config.destination_realm = document.getElementById('destinationRealm').value || null;
+            }
+
+            fetch('/api/traffic/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(config)
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    setStatus('error');
+                    addLog('SYS', 'Start', 'error', data.error);
+                } else {
+                    setStatus('running');
+                    addLog(selectedProtocol.toUpperCase(), 'Start', 'ok', `Traffic started at ${speed} Mbps`);
+                    connectWebSocket();
+                }
+            })
+            .catch(err => {
+                setStatus('error');
+                addLog('SYS', 'Start', 'error', err.message);
+            });
+        }
+
+        // ─── Stop Traffic ─────────────────────────────────────────────────────────
+        function stopTraffic() {
+            fetch('/api/traffic/stop', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    setStatus('completed');
+                    addLog('SYS', 'Stop', 'ok', 'Traffic stopped');
+                })
+                .catch(err => addLog('SYS', 'Stop', 'error', err.message));
+        }
+
+        // ─── WebSocket Connection ─────────────────────────────────────────────────
+        function connectWebSocket() {
+            if (ws && ws.readyState === WebSocket.OPEN) return;
+
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws/metrics`);
+
+            ws.onopen = () => addLog('SYS', 'WS', 'ok', 'Connected to metrics stream');
+
+            ws.onmessage = (event) => {
+                try {
+                    const msg = JSON.parse(event.data);
+                    updateMetrics(msg);
+                } catch (e) { /* ignore parse errors */ }
+            };
+
+            ws.onclose = () => {
+                addLog('SYS', 'WS', 'error', 'Disconnected');
+                setTimeout(() => {
+                    const status = document.getElementById('statusText').textContent.toLowerCase();
+                    if (status === 'running') connectWebSocket();
+                }, 3000);
+            };
+
+            ws.onerror = () => {};
+        }
+
+        // ─── Update Metrics from WebSocket ────────────────────────────────────────
+        function updateMetrics(msg) {
+            if (msg.speed_mbps !== undefined) document.getElementById('metricSpeed').textContent = msg.speed_mbps.toFixed(1);
+            if (msg.total_volume_consumed_mb !== undefined) document.getElementById('metricVolume').textContent = msg.total_volume_consumed_mb.toFixed(2);
+            if (msg.total_requests !== undefined) document.getElementById('metricTotal').textContent = msg.total_requests.toLocaleString();
+            if (msg.successful !== undefined) document.getElementById('metricSuccess').textContent = msg.successful.toLocaleString();
+            if (msg.failed !== undefined) document.getElementById('metricFailed').textContent = msg.failed.toLocaleString();
+            if (msg.active_sessions !== undefined) document.getElementById('metricSessions').textContent = msg.active_sessions.toLocaleString();
+            if (msg.current_tps !== undefined) document.getElementById('metricTPS').textContent = msg.current_tps.toFixed(1);
+            if (msg.avg_latency_ms !== undefined) document.getElementById('metricLatency').textContent = Math.round(msg.avg_latency_ms);
+
+            if (msg.state) setStatus(msg.state);
+
+            // Chart data
+            if (msg.current_tps !== undefined || msg.avg_latency_ms !== undefined) {
+                const now = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                timeLabels.push(now);
+                tpsData.push(msg.current_tps || 0);
+                latencyData.push(msg.avg_latency_ms || 0);
+                if (timeLabels.length > 60) {
+                    timeLabels.shift();
+                    tpsData.shift();
+                    latencyData.shift();
+                }
+            }
+
+            // Response codes
+            if (msg.response_codes) {
+                responseCodes = msg.response_codes;
+                updateResponseChart();
+            }
+
+            // Log entry
+            if (msg.log) {
+                addLog(msg.log.protocol || selectedProtocol.toUpperCase(), msg.log.action || 'REQ', msg.log.status || 'ok', msg.log.latency ? `${msg.log.latency}ms` : '');
+            }
+        }
+
+
+        // ─── Status indicator ─────────────────────────────────────────────────────
+        function setStatus(status) {
+            const indicator = document.getElementById('statusIndicator');
+            const text = document.getElementById('statusText');
+            indicator.className = 'status-indicator status-' + status;
+            text.textContent = status.toUpperCase();
+        }
+
+        // ─── Add log entry ────────────────────────────────────────────────────────
+        function addLog(protocol, action, status, detail) {
+            const container = document.getElementById('logEntries');
+            const now = new Date().toLocaleTimeString('en-US', { hour12: false });
+            const statusClass = (status === 'ok' || status === 'success') ? 'status-ok' : 'status-err';
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.innerHTML = `
+                <span class="ts">${now}</span>
+                <span class="proto">${protocol}</span>
+                <span class="action">${action}</span>
+                <span class="${statusClass}">${detail}</span>
+            `;
+            container.appendChild(entry);
+            if (container.children.length > 200) container.removeChild(container.firstChild);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        // ─── Initialize Charts ────────────────────────────────────────────────────
+        function initCharts() {
+            const tpsCtx = document.getElementById('tpsChart').getContext('2d');
+            tpsChart = new Chart(tpsCtx, {
+                type: 'line',
+                data: {
+                    labels: timeLabels,
+                    datasets: [
+                        {
+                            label: 'TPS',
+                            data: tpsData,
+                            borderColor: '#e94560',
+                            backgroundColor: 'rgba(233,69,96,0.1)',
+                            borderWidth: 2,
+                            fill: true,
+                            tension: 0.3,
+                            pointRadius: 0,
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: 'Latency (ms)',
+                            data: latencyData,
+                            borderColor: '#4caf50',
+                            backgroundColor: 'rgba(76,175,80,0.1)',
+                            borderWidth: 2,
+                            fill: true,
+                            tension: 0.3,
+                            pointRadius: 0,
+                            yAxisID: 'y1'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { intersect: false, mode: 'index' },
+                    plugins: {
+                        legend: { labels: { color: '#a0a0b0', boxWidth: 12, font: { size: 11 } } }
+                    },
+                    scales: {
+                        x: { ticks: { color: '#a0a0b0', maxTicksLimit: 8, font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                        y: { type: 'linear', position: 'left', ticks: { color: '#e94560', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.05)' }, title: { display: true, text: 'TPS', color: '#e94560', font: { size: 10 } } },
+                        y1: { type: 'linear', position: 'right', ticks: { color: '#4caf50', font: { size: 10 } }, grid: { drawOnChartArea: false }, title: { display: true, text: 'Latency (ms)', color: '#4caf50', font: { size: 10 } } }
+                    },
+                    animation: { duration: 0 }
+                }
+            });
+
+            const respCtx = document.getElementById('responseChart').getContext('2d');
+            responseChart = new Chart(respCtx, {
+                type: 'bar',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'Count',
+                        data: [],
+                        backgroundColor: [],
+                        borderRadius: 4,
+                        barThickness: 20
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        title: { display: true, text: 'Response Codes', color: '#a0a0b0', font: { size: 11 } }
+                    },
+                    scales: {
+                        x: { ticks: { color: '#a0a0b0', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                        y: { ticks: { color: '#a0a0b0', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.05)' } }
+                    },
+                    animation: { duration: 0 }
+                }
+            });
+
+            // Update charts every second
+            setInterval(() => {
+                if (tpsChart) tpsChart.update();
+            }, 1000);
+        }
+
+        function updateResponseChart() {
+            if (!responseChart) return;
+            const labels = Object.keys(responseCodes).sort();
+            const data = labels.map(k => responseCodes[k]);
+            const colors = labels.map(code => {
+                const c = parseInt(code);
+                if (c >= 200 && c < 300) return '#4caf50';
+                if (c >= 300 && c < 400) return '#ff9800';
+                if (c >= 400 && c < 500) return '#e94560';
+                return '#f44336';
+            });
+            responseChart.data.labels = labels;
+            responseChart.data.datasets[0].data = data;
+            responseChart.data.datasets[0].backgroundColor = colors;
+            responseChart.update();
+        }
+
+        // ─── Init on load ─────────────────────────────────────────────────────────
+        document.addEventListener('DOMContentLoaded', () => {
+            initCharts();
+            toggleDiameterFields();
+        });
+    </script>
+</body>
+</html>
