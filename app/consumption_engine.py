@@ -132,9 +132,16 @@ class ConsumptionEngine:
     async def stop(self):
         self._running = False
         if self._task:
-            self._task.cancel()
+            # Give the task time to send release requests gracefully
             try:
-                await self._task
+                await asyncio.wait_for(self._task, timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning("Stop timed out waiting for sessions to release, cancelling")
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
             except asyncio.CancelledError:
                 pass
             self._task = None
