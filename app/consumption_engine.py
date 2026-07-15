@@ -171,6 +171,7 @@ class ConsumptionEngine:
 
         except asyncio.CancelledError:
             logger.info("Consumption engine stopped")
+            # Don't re-raise - let sessions handle their own cleanup
         except Exception as e:
             logger.error(f"Engine error: {e}")
             self._metrics["state"] = "error"
@@ -289,9 +290,24 @@ class ConsumptionEngine:
             if metrics_callback:
                 await metrics_callback(self.get_metrics())
 
-        except Exception as e:
-            logger.error(f"Session error: {e}")
-            self._metrics["failed"] += 1
+        except (Exception, asyncio.CancelledError) as e:
+            if not isinstance(e, asyncio.CancelledError):
+                logger.error(f"Session error: {e}")
+                self._metrics["failed"] += 1
+            # Send release on any exit (including cancellation)
+            try:
+                logger.info("Sending release before session cleanup")
+                session.invocation_sequence += 1
+                used_units = self._build_used_units(session, include_requested=False)
+                success, latency, _ = await protocol.release_session(
+                    sequence=session.invocation_sequence,
+                    used_units=used_units,
+                )
+                self._record(success, latency)
+                if metrics_callback:
+                    await metrics_callback(self.get_metrics())
+            except Exception as release_err:
+                logger.error(f"Failed to send release: {release_err}")
         finally:
             session.active = False
             self._metrics["active_sessions"] -= 1
