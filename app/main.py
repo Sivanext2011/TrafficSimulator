@@ -92,24 +92,20 @@ class ChfSessionHandler:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            transport = httpx.AsyncHTTPTransport(retries=1)
             if not self.secure:
                 self._client = httpx.AsyncClient(
-                    transport=transport,
                     verify=False,
                     timeout=httpx.Timeout(30.0, connect=10.0),
                 )
             elif self.cert_path and self.key_path:
                 self._client = httpx.AsyncClient(
-                    transport=transport,
                     verify=False,
                     cert=(self.cert_path, self.key_path),
                     timeout=httpx.Timeout(30.0, connect=10.0),
                 )
             else:
                 self._client = httpx.AsyncClient(
-                    transport=transport,
-                    verify=self.verify_ssl,
+                    verify=False,
                     timeout=httpx.Timeout(30.0, connect=10.0),
                 )
         return self._client
