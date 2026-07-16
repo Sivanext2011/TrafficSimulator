@@ -120,7 +120,7 @@ class ChfSessionHandler:
         return {
             "subscriberIdentifier": sub.get("supi", f"imsi-{sub.get('imsi', '001010000000001')}"),
             "nfConsumerIdentification": {
-                "nFName": sub.get("nf_name", "smf-01"),
+                "nFName": sub.get("nf_name", "423e4567-e89b-12d3-a456-426655440001"),
                 "nFIPv4Address": sub.get("nf_ip", "192.168.0.1"),
                 "nFPLMNID": {
                     "mcc": mcc,
@@ -232,7 +232,7 @@ class ChfSessionHandler:
             "multipleUnitUsage": mscc_list,
             "nfConsumerIdentification": {
                 "nFIPv4Address": sub.get("nf_ip", "192.168.0.1"),
-                "nFName": sub.get("nf_name", "smf-01"),
+                "nFName": sub.get("nf_name", "423e4567-e89b-12d3-a456-426655440001"),
                 "nFPLMNID": {
                     "mcc": mcc,
                     "mnc": mnc,
@@ -299,7 +299,7 @@ class ChfSessionHandler:
             "multipleUnitUsage": mscc_list,
             "nfConsumerIdentification": {
                 "nFIPv4Address": sub.get("nf_ip", "192.168.0.1"),
-                "nFName": sub.get("nf_name", "smf-01"),
+                "nFName": sub.get("nf_name", "423e4567-e89b-12d3-a456-426655440001"),
                 "nFPLMNID": {
                     "mcc": mcc,
                     "mnc": mnc,
