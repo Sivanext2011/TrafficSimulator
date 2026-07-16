@@ -669,7 +669,7 @@ class ControlCommand(BaseModel):
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html_path = Path(__file__).parent / "static" / "index.html"
-    return html_path.read_text()
+    return html_path.read_text(encoding="utf-8")
 
 
 @app.post("/api/certs/upload")
