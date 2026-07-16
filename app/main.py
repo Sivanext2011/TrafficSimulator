@@ -112,101 +112,201 @@ class ChfSessionHandler:
 
     def _build_create_payload(self, rating_groups: List[int]) -> dict:
         sub = self.subscriber
+        mcc = sub.get("mcc", "466")
+        mnc = sub.get("mnc", "01")
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        charging_id = int(time.time()) % 4294967295
+
         return {
             "subscriberIdentifier": sub.get("supi", f"imsi-{sub.get('imsi', '001010000000001')}"),
             "nfConsumerIdentification": {
-                "nfName": "smf-01",
-                "nfIPv4Address": "10.0.0.1",
-                "nfPLMNID": {
-                    "mcc": sub.get("mcc", "001"),
-                    "mnc": sub.get("mnc", "01"),
+                "nFName": sub.get("nf_name", "smf-01"),
+                "nFIPv4Address": sub.get("nf_ip", "192.168.0.1"),
+                "nFPLMNID": {
+                    "mcc": mcc,
+                    "mnc": mnc,
                 },
                 "nodeFunctionality": "SMF",
             },
-            "invocationTimeStamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "invocationTimeStamp": timestamp,
             "invocationSequenceNumber": 0,
+            "serviceSpecificationInfo": "32255_Dec-2020_Rel_16",
             "multipleUnitUsage": [
                 {
                     "ratingGroup": rg,
-                    "requestedUnit": {
-                        "totalVolume": 0,
-                        "uplinkVolume": 0,
-                        "downlinkVolume": 0,
-                    },
+                    "requestedUnit": {},
+                    "uPFID": sub.get("upf_id", "123e4567-e89b-12d3-a456-426655440001"),
                 }
                 for rg in rating_groups
             ],
             "pDUSessionChargingInformation": {
-                "chargingId": int(time.time()) % 4294967295,
-                "userInformation": {
-                    "servedGPSI": sub.get("gpsi", f"msisdn-{sub.get('msisdn', '12125551234')}"),
-                    "unauthenticatedFlag": False,
+                "chargingId": charging_id,
+                "homeProvidedChargingId": charging_id,
+                "userLocationinfo": {
+                    "nrLocation": {
+                        "tai": {
+                            "plmnId": {"mcc": mcc, "mnc": mnc},
+                            "tac": sub.get("tac", "000001"),
+                        },
+                        "ncgi": {
+                            "plmnId": {"mcc": mcc, "mnc": mnc},
+                            "nrCellId": sub.get("nr_cell_id", "000000001"),
+                        },
+                    }
                 },
                 "pduSessionInformation": {
-                    "pduSessionID": 5,
+                    "pduSessionID": int(sub.get("pdu_session_id", 1)),
                     "pduType": "IPV4",
                     "dnnId": sub.get("dnn", "internet"),
+                    "ratType": "NR",
+                    "startTime": timestamp,
+                    "sscMode": "SSC_MODE_1",
+                    "chargingCharacteristicsSelectionMode": "HOME_DEFAULT",
+                    "hPlmnId": {"mcc": mcc, "mnc": mnc},
+                    "servingCNPlmnId": {"mcc": mcc, "mnc": mnc},
                     "networkSlicingInfo": {
                         "sNSSAI": {
                             "sst": sub.get("slice_sst", 1),
                             "sd": sub.get("slice_sd", "000001"),
                         }
                     },
+                    "authorizedQoSInformation": {
+                        "5qi": int(sub.get("5qi", 9)),
+                        "arp": {
+                            "preemptCap": "MAY_PREEMPT",
+                            "preemptVuln": "PREEMPTABLE",
+                            "priorityLevel": 12,
+                        },
+                    },
+                    "pduAddress": {
+                        "pduIPv4Address": sub.get("pdu_ipv4", "10.20.30.40"),
+                    },
+                },
+                "uetimeZone": sub.get("timezone", "+08:00"),
+                "userInformation": {
+                    "servedGPSI": sub.get("gpsi", f"msisdn-{sub.get('msisdn', '12125551234')}"),
+                    "servedPEI": sub.get("pei", "imei-3577300601111100"),
+                    "unauthenticatedFlag": False,
                 },
             },
         }
 
     def _build_update_payload(self, sequence: int, used_units: List[dict]) -> dict:
         sub = self.subscriber
+        mcc = sub.get("mcc", "466")
+        mnc = sub.get("mnc", "01")
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+
+        mscc_list = []
+        for u in used_units:
+            containers = u.get("usedUnitContainer", [])
+            enriched_containers = []
+            for c in containers:
+                enriched_containers.append({
+                    "totalVolume": c.get("totalVolume", 0),
+                    "downlinkVolume": c.get("downlinkVolume", 0),
+                    "uplinkVolume": c.get("uplinkVolume", 0),
+                    "localSequenceNumber": c.get("localSequenceNumber", sequence),
+                    "quotaManagementIndicator": "ONLINE_CHARGING",
+                    "serviceId": int(sub.get("service_id", 100)),
+                    "triggerTimestamp": timestamp,
+                    "triggers": [
+                        {
+                            "triggerCategory": "IMMEDIATE_REPORT",
+                            "triggerType": "VOLUME_LIMIT",
+                        }
+                    ],
+                })
+
+            mscc_list.append({
+                "ratingGroup": u["ratingGroup"],
+                "UsedUnitContainer": enriched_containers,
+                "requestedUnit": {},
+                "uPFID": sub.get("upf_id", "123e4567-e89b-12d3-a456-426655440001"),
+            })
+
         return {
-            "subscriberIdentifier": sub.get("supi", f"imsi-{sub.get('imsi', '001010000000001')}"),
+            "invocationSequenceNumber": sequence,
+            "invocationTimeStamp": timestamp,
+            "serviceSpecificationInfo": "32255_Dec-2020_Rel_16",
+            "multipleUnitUsage": mscc_list,
             "nfConsumerIdentification": {
-                "nfName": "smf-01",
-                "nfIPv4Address": "10.0.0.1",
-                "nfPLMNID": {
-                    "mcc": sub.get("mcc", "001"),
-                    "mnc": sub.get("mnc", "01"),
+                "nFIPv4Address": sub.get("nf_ip", "192.168.0.1"),
+                "nFName": sub.get("nf_name", "smf-01"),
+                "nFPLMNID": {
+                    "mcc": mcc,
+                    "mnc": mnc,
                 },
                 "nodeFunctionality": "SMF",
             },
-            "invocationTimeStamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-            "invocationSequenceNumber": sequence,
-            "multipleUnitUsage": [
-                {
-                    "ratingGroup": u["ratingGroup"],
-                    "usedUnitContainer": u.get("usedUnitContainer", []),
-                    "requestedUnit": u.get("requestedUnit", {
-                        "totalVolume": 0,
-                        "uplinkVolume": 0,
-                        "downlinkVolume": 0,
-                    }),
-                }
-                for u in used_units
-            ],
+            "pDUSessionChargingInformation": {
+                "chargingId": int(sub.get("charging_id", int(time.time()) % 4294967295)),
+                "homeProvidedChargingId": int(sub.get("charging_id", int(time.time()) % 4294967295)),
+                "userLocationinfo": {
+                    "nrLocation": {
+                        "tai": {
+                            "plmnId": {"mcc": mcc, "mnc": mnc},
+                            "tac": sub.get("tac", "000001"),
+                        },
+                        "ncgi": {
+                            "plmnId": {"mcc": mcc, "mnc": mnc},
+                            "nrCellId": sub.get("nr_cell_id", "000000001"),
+                        },
+                    }
+                },
+                "uetimeZone": sub.get("timezone", "+08:00"),
+            },
+            "subscriberIdentifier": sub.get("supi", f"imsi-{sub.get('imsi', '001010000000001')}"),
         }
 
     def _build_release_payload(self, sequence: int, used_units: List[dict]) -> dict:
         sub = self.subscriber
+        mcc = sub.get("mcc", "466")
+        mnc = sub.get("mnc", "01")
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+
+        mscc_list = []
+        for u in used_units:
+            containers = u.get("usedUnitContainer", [])
+            enriched_containers = []
+            for c in containers:
+                enriched_containers.append({
+                    "totalVolume": c.get("totalVolume", 0),
+                    "downlinkVolume": c.get("downlinkVolume", 0),
+                    "uplinkVolume": c.get("uplinkVolume", 0),
+                    "localSequenceNumber": c.get("localSequenceNumber", sequence),
+                    "quotaManagementIndicator": "ONLINE_CHARGING",
+                    "serviceId": int(sub.get("service_id", 100)),
+                    "triggerTimestamp": timestamp,
+                    "triggers": [
+                        {
+                            "triggerCategory": "IMMEDIATE_REPORT",
+                            "triggerType": "FINAL",
+                        }
+                    ],
+                })
+
+            mscc_list.append({
+                "ratingGroup": u["ratingGroup"],
+                "UsedUnitContainer": enriched_containers,
+                "uPFID": sub.get("upf_id", "123e4567-e89b-12d3-a456-426655440001"),
+            })
+
         return {
-            "subscriberIdentifier": sub.get("supi", f"imsi-{sub.get('imsi', '001010000000001')}"),
+            "invocationSequenceNumber": sequence,
+            "invocationTimeStamp": timestamp,
+            "serviceSpecificationInfo": "32255_Dec-2020_Rel_16",
+            "multipleUnitUsage": mscc_list,
             "nfConsumerIdentification": {
-                "nfName": "smf-01",
-                "nfIPv4Address": "10.0.0.1",
-                "nfPLMNID": {
-                    "mcc": sub.get("mcc", "001"),
-                    "mnc": sub.get("mnc", "01"),
+                "nFIPv4Address": sub.get("nf_ip", "192.168.0.1"),
+                "nFName": sub.get("nf_name", "smf-01"),
+                "nFPLMNID": {
+                    "mcc": mcc,
+                    "mnc": mnc,
                 },
                 "nodeFunctionality": "SMF",
             },
-            "invocationTimeStamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-            "invocationSequenceNumber": sequence,
-            "multipleUnitUsage": [
-                {
-                    "ratingGroup": u["ratingGroup"],
-                    "usedUnitContainer": u.get("usedUnitContainer", []),
-                }
-                for u in used_units
-            ],
+            "subscriberIdentifier": sub.get("supi", f"imsi-{sub.get('imsi', '001010000000001')}"),
         }
 
     async def create_session(self, rating_groups: List[int]):
