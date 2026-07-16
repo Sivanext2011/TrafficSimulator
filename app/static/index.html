@@ -62,13 +62,41 @@
             color: #fff;
             border-color: var(--accent);
         }
+        /* Sub-tabs (Integration / Traffic) */
+        .sub-tabs {
+            display: flex;
+            gap: 0.5rem;
+            padding: 0.6rem 2rem 0;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--bg-card);
+        }
+        .sub-tabs button {
+            padding: 0.4rem 1rem;
+            border: 1px solid var(--bg-card);
+            background: var(--bg-card);
+            color: var(--text-secondary);
+            border-radius: 6px 6px 0 0;
+            cursor: pointer;
+            font-size: 0.8rem;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        .sub-tabs button.active {
+            background: var(--bg-primary);
+            color: var(--accent);
+            border-color: var(--accent);
+            border-bottom-color: var(--bg-primary);
+        }
+        .sub-tabs button:hover:not(.active) {
+            color: var(--text-primary);
+        }
         .main-grid {
             display: grid;
             grid-template-columns: 380px 1fr;
             grid-template-rows: 1fr auto;
             gap: 1.2rem;
             padding: 1.2rem;
-            max-height: calc(100vh - 70px);
+            max-height: calc(100vh - 110px);
             overflow: hidden;
         }
         @media (max-width: 1024px) {
@@ -93,7 +121,7 @@
         }
         .config-panel {
             overflow-y: auto;
-            max-height: calc(100vh - 90px);
+            max-height: calc(100vh - 130px);
             display: flex;
             flex-direction: column;
             gap: 1rem;
@@ -109,7 +137,9 @@
             text-transform: uppercase;
             letter-spacing: 0.3px;
         }
-        .form-group input, .form-group select {
+        .form-group input[type="text"],
+        .form-group input[type="number"],
+        .form-group select {
             width: 100%;
             padding: 0.5rem 0.7rem;
             background: var(--bg-primary);
@@ -161,11 +191,30 @@
             margin-top: 0.5rem;
         }
         .btn-upload:hover { opacity: 0.85; }
+        .btn-save {
+            background: var(--success);
+            color: #fff;
+            width: 100%;
+            margin-top: 0.7rem;
+            padding: 0.7rem 1.2rem;
+        }
+        .btn-save:hover { background: #388e3c; }
         .btn-group {
             display: flex;
             gap: 0.7rem;
             margin-top: 0.5rem;
         }
+        .save-indicator {
+            display: none;
+            align-items: center;
+            gap: 0.4rem;
+            margin-top: 0.5rem;
+            font-size: 0.8rem;
+            color: var(--success);
+            font-weight: 600;
+        }
+        .save-indicator.visible { display: flex; }
+        .save-indicator .checkmark { font-size: 1rem; }
         .speed-slider-container {
             display: flex;
             align-items: center;
@@ -187,7 +236,7 @@
             flex-direction: column;
             gap: 1rem;
             overflow-y: auto;
-            max-height: calc(100vh - 90px);
+            max-height: calc(100vh - 130px);
         }
         .metrics-panel::-webkit-scrollbar { width: 6px; }
         .metrics-panel::-webkit-scrollbar-thumb { background: var(--bg-card); border-radius: 3px; }
@@ -290,6 +339,8 @@
         .log-entry .latency { color: var(--text-secondary); margin-left: auto; }
         .diameter-fields { display: none; }
         .diameter-fields.visible { display: block; }
+        .tab-content { display: none; }
+        .tab-content.active { display: flex; flex-direction: column; gap: 1rem; }
         input[type="file"] {
             font-size: 0.78rem;
             color: var(--text-secondary);
@@ -318,158 +369,180 @@
         </div>
     </header>
 
+    <!-- Sub-tabs: Integration / Traffic -->
+    <div class="sub-tabs" id="subTabs">
+        <button data-tab="integration">Integration</button>
+        <button class="active" data-tab="traffic">Traffic</button>
+    </div>
+
 
     <div class="main-grid">
         <!-- CONFIG PANEL -->
         <div class="config-panel">
-            <div class="card">
-                <h3>Endpoint</h3>
-                <div class="form-group">
-                    <label>FQDN</label>
-                    <input type="text" id="fqdn" placeholder="e.g. chf.example.com">
+
+            <!-- ═══ INTEGRATION TAB ═══ -->
+            <div class="tab-content" id="tabIntegration">
+                <div class="card">
+                    <h3>Endpoint</h3>
+                    <div class="form-group">
+                        <label>FQDN</label>
+                        <input type="text" id="fqdn" placeholder="e.g. chf.example.com">
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Port</label>
+                            <input type="number" id="port" placeholder="443">
+                        </div>
+                        <div class="form-group">
+                            <label>Base Path</label>
+                            <input type="text" id="basePath" placeholder="/nchf-convergedcharging/v3">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label><input type="checkbox" id="secure" checked> HTTPS (TLS)</label>
+                        </div>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="verifySsl"> Verify SSL</label>
+                        </div>
+                    </div>
                 </div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>Port</label>
-                        <input type="number" id="port" placeholder="443">
+
+                <!-- Diameter-specific fields -->
+                <div class="card diameter-fields" id="diameterFields">
+                    <h3>Diameter Connection</h3>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Diameter Host (IP/FQDN)</label>
+                            <input type="text" id="diameterHost" placeholder="10.0.0.1">
+                        </div>
+                        <div class="form-group">
+                            <label>Diameter Port</label>
+                            <input type="number" id="diameterPort" value="3868">
+                        </div>
                     </div>
-                    <div class="form-group">
-                        <label>Base Path</label>
-                        <input type="text" id="basePath" placeholder="/nchf-convergedcharging/v3">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Origin-Host</label>
+                            <input type="text" id="originHost" placeholder="telecom-simulator.local">
+                        </div>
+                        <div class="form-group">
+                            <label>Origin-Realm</label>
+                            <input type="text" id="originRealm" placeholder="simulator.local">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Destination-Host</label>
+                            <input type="text" id="destinationHost" placeholder="ocs.operator.com">
+                        </div>
+                        <div class="form-group">
+                            <label>Destination-Realm</label>
+                            <input type="text" id="destinationRealm" placeholder="operator.com">
+                        </div>
                     </div>
                 </div>
-                <div class="form-row">
+
+                <div class="card">
+                    <h3>Certificates</h3>
                     <div class="form-group">
-                        <label><input type="checkbox" id="secure" checked> HTTPS (TLS)</label>
+                        <label>Client Certificate (.crt)</label>
+                        <input type="file" id="clientCert" accept=".crt,.pem">
                     </div>
                     <div class="form-group">
-                        <label><input type="checkbox" id="verifySsl"> Verify SSL</label>
+                        <label>Client Key (.key)</label>
+                        <input type="file" id="clientKey" accept=".key,.pem">
+                    </div>
+                    <div class="form-group">
+                        <label>CA Certificate (.crt)</label>
+                        <input type="file" id="caCert" accept=".crt,.pem">
+                    </div>
+                    <button class="btn btn-upload" onclick="uploadCerts()">Upload Certificates</button>
+                </div>
+
+                <div class="card">
+                    <button class="btn btn-save" onclick="saveSettings()">&#128190; Save Settings</button>
+                    <div class="save-indicator" id="saveIndicator">
+                        <span class="checkmark">&#10004;</span>
+                        <span>Settings Saved</span>
                     </div>
                 </div>
             </div>
 
-            <!-- Diameter-specific fields -->
-            <div class="card diameter-fields" id="diameterFields">
-                <h3>Diameter Connection</h3>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>Diameter Host (IP/FQDN)</label>
-                        <input type="text" id="diameterHost" placeholder="10.0.0.1">
+            <!-- ═══ TRAFFIC TAB ═══ -->
+            <div class="tab-content active" id="tabTraffic">
+                <div class="card">
+                    <h3>Subscriber</h3>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>MSISDN</label>
+                            <input type="text" id="msisdn" placeholder="14155551234">
+                        </div>
+                        <div class="form-group">
+                            <label>IMSI</label>
+                            <input type="text" id="imsi" placeholder="310260000000001">
+                        </div>
                     </div>
-                    <div class="form-group">
-                        <label>Diameter Port</label>
-                        <input type="number" id="diameterPort" value="3868">
+                    <div class="form-row-3">
+                        <div class="form-group">
+                            <label>Slice SST</label>
+                            <input type="number" id="sliceSST" placeholder="1">
+                        </div>
+                        <div class="form-group">
+                            <label>Slice SD</label>
+                            <input type="text" id="sliceSD" placeholder="000001">
+                        </div>
+                        <div class="form-group">
+                            <label>DNN</label>
+                            <input type="text" id="dnn" placeholder="internet">
+                        </div>
+                    </div>
+                    <div class="form-row-3">
+                        <div class="form-group">
+                            <label>APN</label>
+                            <input type="text" id="apn" placeholder="internet">
+                        </div>
+                        <div class="form-group">
+                            <label>MCC</label>
+                            <input type="text" id="mcc" placeholder="310">
+                        </div>
+                        <div class="form-group">
+                            <label>MNC</label>
+                            <input type="text" id="mnc" placeholder="260">
+                        </div>
                     </div>
                 </div>
-                <div class="form-row">
+
+                <div class="card">
+                    <h3>Traffic</h3>
                     <div class="form-group">
-                        <label>Origin-Host</label>
-                        <input type="text" id="originHost" placeholder="telecom-simulator.local">
+                        <label>Download Speed (Mbps)</label>
+                        <div class="speed-slider-container">
+                            <input type="range" id="speedSlider" min="0" max="11" step="1" value="5">
+                            <span class="speed-value" id="speedDisplay">10</span>
+                        </div>
                     </div>
                     <div class="form-group">
-                        <label>Origin-Realm</label>
-                        <input type="text" id="originRealm" placeholder="simulator.local">
+                        <label>Rating Groups (comma-separated)</label>
+                        <input type="text" id="ratingGroups" placeholder="1000,2000,3000" value="1000">
                     </div>
-                </div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>Destination-Host</label>
-                        <input type="text" id="destinationHost" placeholder="ocs.operator.com">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Session Duration (sec)</label>
+                            <input type="number" id="sessionDuration" placeholder="300" value="300">
+                        </div>
+                        <div class="form-group">
+                            <label>Number of Sessions</label>
+                            <input type="number" id="numSessions" placeholder="1" value="1">
+                        </div>
                     </div>
-                    <div class="form-group">
-                        <label>Destination-Realm</label>
-                        <input type="text" id="destinationRealm" placeholder="operator.com">
+                    <div class="btn-group">
+                        <button class="btn btn-start" onclick="startTraffic()">&#9654; Start</button>
+                        <button class="btn btn-stop" onclick="stopTraffic()">&#9632; Stop</button>
                     </div>
                 </div>
             </div>
 
-            <div class="card">
-                <h3>Certificates</h3>
-                <div class="form-group">
-                    <label>Client Certificate (.crt)</label>
-                    <input type="file" id="clientCert" accept=".crt,.pem">
-                </div>
-                <div class="form-group">
-                    <label>Client Key (.key)</label>
-                    <input type="file" id="clientKey" accept=".key,.pem">
-                </div>
-                <div class="form-group">
-                    <label>CA Certificate (.crt)</label>
-                    <input type="file" id="caCert" accept=".crt,.pem">
-                </div>
-                <button class="btn btn-upload" onclick="uploadCerts()">Upload Certificates</button>
-            </div>
-
-            <div class="card">
-                <h3>Subscriber</h3>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>MSISDN</label>
-                        <input type="text" id="msisdn" placeholder="14155551234">
-                    </div>
-                    <div class="form-group">
-                        <label>IMSI</label>
-                        <input type="text" id="imsi" placeholder="310260000000001">
-                    </div>
-                </div>
-                <div class="form-row-3">
-                    <div class="form-group">
-                        <label>Slice SST</label>
-                        <input type="number" id="sliceSST" placeholder="1">
-                    </div>
-                    <div class="form-group">
-                        <label>Slice SD</label>
-                        <input type="text" id="sliceSD" placeholder="000001">
-                    </div>
-                    <div class="form-group">
-                        <label>DNN</label>
-                        <input type="text" id="dnn" placeholder="internet">
-                    </div>
-                </div>
-                <div class="form-row-3">
-                    <div class="form-group">
-                        <label>APN</label>
-                        <input type="text" id="apn" placeholder="internet">
-                    </div>
-                    <div class="form-group">
-                        <label>MCC</label>
-                        <input type="text" id="mcc" placeholder="310">
-                    </div>
-                    <div class="form-group">
-                        <label>MNC</label>
-                        <input type="text" id="mnc" placeholder="260">
-                    </div>
-                </div>
-            </div>
-
-            <div class="card">
-                <h3>Traffic</h3>
-                <div class="form-group">
-                    <label>Download Speed (Mbps)</label>
-                    <div class="speed-slider-container">
-                        <input type="range" id="speedSlider" min="0" max="11" step="1" value="5">
-                        <span class="speed-value" id="speedDisplay">10</span>
-                    </div>
-                </div>
-                <div class="form-group">
-                    <label>Rating Groups (comma-separated)</label>
-                    <input type="text" id="ratingGroups" placeholder="1000,2000,3000" value="1000">
-                </div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>Session Duration (sec)</label>
-                        <input type="number" id="sessionDuration" placeholder="300" value="300">
-                    </div>
-                    <div class="form-group">
-                        <label>Number of Sessions</label>
-                        <input type="number" id="numSessions" placeholder="1" value="1">
-                    </div>
-                </div>
-                <div class="btn-group">
-                    <button class="btn btn-start" onclick="startTraffic()">&#9654; Start</button>
-                    <button class="btn btn-stop" onclick="stopTraffic()">&#9632; Stop</button>
-                </div>
-            </div>
         </div>
 
 
@@ -547,6 +620,7 @@
         </div>
     </div>
 
+
     <script>
         // ─── State ───────────────────────────────────────────────────────────────
         let selectedProtocol = 'chf';
@@ -562,6 +636,32 @@
         const speedSteps = [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
         const diameterProtocols = ['gy', 'ro', 'sy'];
         const sbiProtocols = ['chf', 'pcf', 'scapv2'];
+
+        // ─── Integration field IDs and their localStorage keys ───────────────────
+        const integrationFields = {
+            'fqdn': 'sim_fqdn',
+            'port': 'sim_port',
+            'basePath': 'sim_basePath',
+            'secure': 'sim_secure',
+            'verifySsl': 'sim_verifySsl',
+            'diameterHost': 'sim_diameterHost',
+            'diameterPort': 'sim_diameterPort',
+            'originHost': 'sim_originHost',
+            'originRealm': 'sim_originRealm',
+            'destinationHost': 'sim_destinationHost',
+            'destinationRealm': 'sim_destinationRealm'
+        };
+
+        // ─── Sub-Tabs (Integration / Traffic) ────────────────────────────────────
+        document.getElementById('subTabs').addEventListener('click', (e) => {
+            if (e.target.tagName === 'BUTTON') {
+                document.querySelectorAll('#subTabs button').forEach(b => b.classList.remove('active'));
+                e.target.classList.add('active');
+                const tab = e.target.dataset.tab;
+                document.getElementById('tabIntegration').classList.toggle('active', tab === 'integration');
+                document.getElementById('tabTraffic').classList.toggle('active', tab === 'traffic');
+            }
+        });
 
         // ─── Protocol Tabs ───────────────────────────────────────────────────────
         document.getElementById('protocolTabs').addEventListener('click', (e) => {
@@ -603,6 +703,38 @@
                 diameterSection.classList.remove('visible');
             }
         }
+
+        // ─── Save / Load Settings (localStorage) ─────────────────────────────────
+        function saveSettings() {
+            for (const [fieldId, storageKey] of Object.entries(integrationFields)) {
+                const el = document.getElementById(fieldId);
+                if (!el) continue;
+                if (el.type === 'checkbox') {
+                    localStorage.setItem(storageKey, el.checked ? 'true' : 'false');
+                } else {
+                    localStorage.setItem(storageKey, el.value);
+                }
+            }
+            // Show saved indicator
+            const indicator = document.getElementById('saveIndicator');
+            indicator.classList.add('visible');
+            setTimeout(() => indicator.classList.remove('visible'), 3000);
+        }
+
+        function loadSavedSettings() {
+            for (const [fieldId, storageKey] of Object.entries(integrationFields)) {
+                const saved = localStorage.getItem(storageKey);
+                if (saved === null) continue;
+                const el = document.getElementById(fieldId);
+                if (!el) continue;
+                if (el.type === 'checkbox') {
+                    el.checked = (saved === 'true');
+                } else {
+                    el.value = saved;
+                }
+            }
+        }
+
 
         // ─── Speed Slider (logarithmic steps) ────────────────────────────────────
         const speedSlider = document.getElementById('speedSlider');
@@ -662,9 +794,11 @@
                 .catch(err => addLog('SYS', 'Upload', 'error', err.message));
         }
 
-
         // ─── Start Traffic ────────────────────────────────────────────────────────
         function startTraffic() {
+            // Auto-save integration settings on start
+            saveSettings();
+
             const speed = getSpeedFromSlider();
             const ratingGroupsStr = document.getElementById('ratingGroups').value || '1000';
             const ratingGroups = ratingGroupsStr.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
@@ -739,6 +873,7 @@
                 .catch(err => addLog('SYS', 'Stop', 'error', err.message));
         }
 
+
         // ─── WebSocket Connection ─────────────────────────────────────────────────
         function connectWebSocket() {
             if (ws && ws.readyState === WebSocket.OPEN) return;
@@ -803,7 +938,6 @@
                 addLog(msg.log.protocol || selectedProtocol.toUpperCase(), msg.log.action || 'REQ', msg.log.status || 'ok', msg.log.latency ? `${msg.log.latency}ms` : '');
             }
         }
-
 
         // ─── Status indicator ─────────────────────────────────────────────────────
         function setStatus(status) {
@@ -932,6 +1066,7 @@
 
         // ─── Init on load ─────────────────────────────────────────────────────────
         document.addEventListener('DOMContentLoaded', () => {
+            loadSavedSettings();
             initCharts();
             toggleDiameterFields();
         });
