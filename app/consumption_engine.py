@@ -3,8 +3,15 @@
 The slider controls the simulated download speed (Mbps). The engine:
 1. Creates a session with requested units for each rating group
 2. Simulates consumption at the configured speed
-3. When granted quota is exhausted, sends an update request
+3. When granted quota threshold is reached (or quota exhausted, or validity
+   time expires), sends an update request with the appropriate trigger type
 4. Repeats until stopped or session duration expires
+
+Trigger-aware behavior (from CHF responses):
+- volumeQuotaThreshold: report when used volume reaches (grantedVolume - threshold)
+- validityTime: report when timer expires regardless of volume
+- volumeLimit64 (session-level): report when cumulative volume crosses limit
+- timeLimit (session-level): report when cumulative time crosses limit
 """
 
 import asyncio
@@ -17,26 +24,62 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class TriggerConfig:
+    """Trigger thresholds from CHF Create/Update responses."""
+    # Per-rating-group (from multipleUnitInformation)
+    volume_quota_threshold: int = 0  # bytes - report when remaining <= this
+    validity_time: int = 0  # seconds - report after this time
+
+    # Session-level (from triggers array in Create response)
+    volume_limit: int = 0  # bytes - session cumulative volume limit
+    time_limit: int = 0  # seconds - session cumulative time limit
+    max_number_of_ccc: int = 0  # max charging condition changes
+
+
+@dataclass
 class RatingGroupState:
     """Tracks quota state for a single rating group."""
     rating_group: int
     granted_total_volume: int = 0  # bytes granted by server
     granted_time: int = 0  # seconds granted
-    used_total_volume: int = 0  # bytes consumed so far
-    used_time: int = 0  # seconds consumed
+    used_total_volume: int = 0  # bytes consumed since last report
+    used_time: int = 0  # seconds consumed since last report
     used_uplink: int = 0
     used_downlink: int = 0
+    cumulative_volume: int = 0  # total bytes consumed across all updates
+    cumulative_time: int = 0  # total seconds across all updates
     local_sequence_number: int = 0
     result_code: str = ""
+    grant_timestamp: float = 0.0  # when the current grant was received
+
+    # Trigger config for this rating group
+    triggers: TriggerConfig = field(default_factory=TriggerConfig)
 
     @property
     def remaining_volume(self) -> int:
         return max(0, self.granted_total_volume - self.used_total_volume)
 
     @property
+    def threshold_reached(self) -> bool:
+        """True when consumed volume reaches the quota threshold point."""
+        if self.triggers.volume_quota_threshold > 0 and self.granted_total_volume > 0:
+            report_at = self.granted_total_volume - self.triggers.volume_quota_threshold
+            return self.used_total_volume >= report_at
+        return False
+
+    @property
     def is_exhausted(self) -> bool:
+        """True when full granted volume is consumed."""
         if self.granted_total_volume > 0:
             return self.used_total_volume >= self.granted_total_volume
+        return False
+
+    @property
+    def validity_expired(self) -> bool:
+        """True when validity time has elapsed since grant."""
+        if self.triggers.validity_time > 0 and self.grant_timestamp > 0:
+            elapsed = time.time() - self.grant_timestamp
+            return elapsed >= self.triggers.validity_time
         return False
 
 
@@ -51,12 +94,16 @@ class SessionState:
     start_time: float = 0.0
     last_update_time: float = 0.0
 
+    # Session-level triggers (from CHF Create response)
+    session_triggers: TriggerConfig = field(default_factory=TriggerConfig)
+
 
 class ConsumptionEngine:
     """Simulates data consumption and drives charging session lifecycle.
 
     The speed_mbps controls how fast data is 'consumed'. When granted units
-    are exhausted for any rating group, an update is triggered.
+    threshold is reached, validity time expires, or session-level triggers
+    fire, an update is sent.
     """
 
     def __init__(self):
@@ -171,7 +218,6 @@ class ConsumptionEngine:
 
         except asyncio.CancelledError:
             logger.info("Consumption engine stopped")
-            # Don't re-raise - let sessions handle their own cleanup
         except Exception as e:
             logger.error(f"Engine error: {e}")
             self._metrics["state"] = "error"
@@ -200,14 +246,15 @@ class ConsumptionEngine:
             session.charging_data_ref = protocol.get_session_ref()
             session.active = True
 
-            # Parse granted units from response
+            # Parse session-level triggers and granted units from response
+            self._parse_session_triggers(session, response_data)
             self._parse_grants(session, response_data)
 
             # If all rating groups failed on create, skip consumption and release immediately
             if self._all_rating_groups_failed(session):
                 logger.info("All rating groups failed on CREATE — sending release immediately")
                 session.invocation_sequence += 1
-                used_units = self._build_used_units(session, include_requested=False)
+                used_units = self._build_used_units(session, include_requested=False, trigger_type="FINAL")
                 success, latency, _ = await protocol.release_session(
                     sequence=session.invocation_sequence,
                     used_units=used_units,
@@ -223,6 +270,12 @@ class ConsumptionEngine:
                 if elapsed >= session_duration_sec:
                     break
 
+                # Check session-level time limit
+                if session.session_triggers.time_limit > 0:
+                    if elapsed >= session.session_triggers.time_limit:
+                        logger.info("Session TIME_LIMIT reached — sending update then release")
+                        break
+
                 # Simulate consumption
                 time_step = 0.5  # check every 500ms
                 await asyncio.sleep(time_step)
@@ -234,24 +287,46 @@ class ConsumptionEngine:
                 # Distribute across rating groups (simple even split)
                 per_rg = bytes_consumed // len(rating_groups) if rating_groups else 0
 
-                any_exhausted = False
+                trigger_type = None
+                any_triggered = False
+
                 for rg_id, rg_state in session.rating_groups.items():
                     rg_state.used_total_volume += per_rg
                     rg_state.used_downlink += int(per_rg * 0.7)
                     rg_state.used_uplink += int(per_rg * 0.3)
                     rg_state.used_time += int(time_step)
+                    rg_state.cumulative_volume += per_rg
+                    rg_state.cumulative_time += int(time_step)
 
-                    if rg_state.is_exhausted:
-                        any_exhausted = True
+                    # Check triggers in priority order
+                    if rg_state.validity_expired and not any_triggered:
+                        trigger_type = "VALIDITY_TIME"
+                        any_triggered = True
+                    elif rg_state.threshold_reached and not any_triggered:
+                        trigger_type = "QUOTA_THRESHOLD"
+                        any_triggered = True
+                    elif rg_state.is_exhausted and not any_triggered:
+                        trigger_type = "VOLUME_LIMIT"
+                        any_triggered = True
+
+                # Check session-level volume limit
+                if not any_triggered and session.session_triggers.volume_limit > 0:
+                    total_cumulative = sum(rg.cumulative_volume for rg in session.rating_groups.values())
+                    if total_cumulative >= session.session_triggers.volume_limit:
+                        trigger_type = "VOLUME_LIMIT"
+                        any_triggered = True
 
                 # Update total consumption metric
-                total_consumed = sum(rg.used_total_volume for rg in session.rating_groups.values())
+                total_consumed = sum(rg.cumulative_volume for rg in session.rating_groups.values())
                 self._metrics["total_volume_consumed_mb"] = total_consumed / (1024 * 1024)
 
-                # If any RG exhausted, send update
-                if any_exhausted or (time.time() - session.last_update_time > 30):
+                # If any trigger fired, or fallback 30s timer, send update
+                if any_triggered or (time.time() - session.last_update_time > 30):
+                    if not trigger_type:
+                        trigger_type = "TIME_LIMIT"  # periodic fallback
+
                     session.invocation_sequence += 1
-                    used_units = self._build_used_units(session)
+                    used_units = self._build_used_units(session, trigger_type=trigger_type)
 
                     success, latency, response_data = await protocol.update_session(
                         sequence=session.invocation_sequence,
@@ -264,7 +339,7 @@ class ConsumptionEngine:
                         await metrics_callback(self.get_metrics())
 
                     if success:
-                        # Reset consumed counters and apply new grants
+                        # Parse new grants and triggers from response
                         self._parse_grants(session, response_data)
 
                         # If all rating groups failed, stop consuming and release
@@ -272,16 +347,16 @@ class ConsumptionEngine:
                             logger.info("All rating groups failed/exhausted — sending release")
                             break
 
-                        # Only reset after confirming we got new grants
+                        # Reset consumed counters (cumulative keeps accumulating)
                         self._reset_used(session)
                     else:
                         # HTTP error — stop and release
-                        logger.warning(f"Update failed with HTTP error — terminating session")
+                        logger.warning("Update failed with HTTP error — terminating session")
                         break
 
             # === RELEASE ===
             session.invocation_sequence += 1
-            used_units = self._build_used_units(session, include_requested=False)
+            used_units = self._build_used_units(session, include_requested=False, trigger_type="FINAL")
             success, latency, _ = await protocol.release_session(
                 sequence=session.invocation_sequence,
                 used_units=used_units,
@@ -298,7 +373,7 @@ class ConsumptionEngine:
             try:
                 logger.info("Sending release before session cleanup")
                 session.invocation_sequence += 1
-                used_units = self._build_used_units(session, include_requested=False)
+                used_units = self._build_used_units(session, include_requested=False, trigger_type="FINAL")
                 success, latency, _ = await protocol.release_session(
                     sequence=session.invocation_sequence,
                     used_units=used_units,
@@ -312,13 +387,46 @@ class ConsumptionEngine:
             session.active = False
             self._metrics["active_sessions"] -= 1
 
-    def _parse_grants(self, session: SessionState, response_data: Optional[dict]):
-        """Parse multipleUnitInformation to extract granted units.
+    def _parse_session_triggers(self, session: SessionState, response_data: Optional[dict]):
+        """Parse session-level triggers from CHF Create response.
 
-        Handles:
-        - SUCCESS with grantedUnit → use granted values
-        - RATING_FAILED / no grantedUnit → set granted to 0 (will trigger release)
-        - No response → default grant for first request only
+        The Create response contains a 'triggers' array like:
+        [
+            {"triggerType": "TIME_LIMIT", "timeLimit": 3600, "triggerCategory": "IMMEDIATE_REPORT"},
+            {"triggerType": "VOLUME_LIMIT", "volumeLimit64": 52428800, "triggerCategory": "IMMEDIATE_REPORT"},
+            {"triggerType": "MAX_NUMBER_OF_CHANGES_IN_CHARGING_CONDITIONS", "maxNumberOfccc": 1}
+        ]
+        """
+        if not response_data:
+            return
+
+        triggers_list = response_data.get("triggers", [])
+        for trigger in triggers_list:
+            trigger_type = trigger.get("triggerType", "")
+            if trigger_type == "TIME_LIMIT":
+                session.session_triggers.time_limit = trigger.get("timeLimit", 0)
+                logger.info(f"  Session trigger: TIME_LIMIT = {session.session_triggers.time_limit}s")
+            elif trigger_type == "VOLUME_LIMIT":
+                session.session_triggers.volume_limit = trigger.get("volumeLimit64", 0)
+                logger.info(f"  Session trigger: VOLUME_LIMIT = {session.session_triggers.volume_limit} bytes")
+            elif trigger_type == "MAX_NUMBER_OF_CHANGES_IN_CHARGING_CONDITIONS":
+                session.session_triggers.max_number_of_ccc = trigger.get("maxNumberOfccc", 0)
+                logger.info(f"  Session trigger: MAX_CCC = {session.session_triggers.max_number_of_ccc}")
+
+    def _parse_grants(self, session: SessionState, response_data: Optional[dict]):
+        """Parse multipleUnitInformation to extract granted units and per-RG triggers.
+
+        The Update response looks like:
+        {
+            "multipleUnitInformation": [{
+                "ratingGroup": 1000,
+                "resultCode": "SUCCESS",
+                "grantedUnit": {"totalVolume": 524288},
+                "volumeQuotaThreshold": 10240,
+                "validityTime": 900,
+                "quotaHoldingTime": 0
+            }]
+        }
         """
         if not response_data:
             # Default grant only if this is the first request (no result yet)
@@ -326,6 +434,7 @@ class ConsumptionEngine:
                 if not rg_state.result_code:
                     rg_state.granted_total_volume = 10 * 1024 * 1024  # 10MB default
                     rg_state.granted_time = 300
+                    rg_state.grant_timestamp = time.time()
             return
 
         units_info = response_data.get("multipleUnitInformation", [])
@@ -342,9 +451,19 @@ class ConsumptionEngine:
                         rg_state.granted_total_volume = granted.get("totalVolume", 0)
                         rg_state.granted_time = granted.get("time", 0)
                     else:
-                        # SUCCESS but no grantedUnit — no more quota
                         rg_state.granted_total_volume = 0
                         rg_state.granted_time = 0
+
+                    # Parse per-RG trigger thresholds
+                    rg_state.triggers.volume_quota_threshold = unit.get("volumeQuotaThreshold", 0)
+                    rg_state.triggers.validity_time = unit.get("validityTime", 0)
+                    rg_state.grant_timestamp = time.time()
+
+                    logger.info(
+                        f"  RG {rg_id}: granted={rg_state.granted_total_volume} bytes, "
+                        f"threshold={rg_state.triggers.volume_quota_threshold}, "
+                        f"validityTime={rg_state.triggers.validity_time}s"
+                    )
                 else:
                     # RATING_FAILED or other error — no grant
                     rg_state.granted_total_volume = 0
@@ -362,20 +481,35 @@ class ConsumptionEngine:
                 return False
         return True
 
-    def _build_used_units(self, session: SessionState, include_requested: bool = True) -> List[dict]:
+    def _build_used_units(
+        self,
+        session: SessionState,
+        include_requested: bool = True,
+        trigger_type: str = "QUOTA_THRESHOLD",
+    ) -> List[dict]:
         """Build usedUnitContainer list for update/release.
 
-        Args:
-            include_requested: If True, include requestedUnit (for updates). False for release.
+        Includes trigger information matching what the real SMF sends:
+        - triggerType: QUOTA_THRESHOLD, VOLUME_LIMIT, TIME_LIMIT, VALIDITY_TIME, FINAL
+        - triggerCategory: IMMEDIATE_REPORT
         """
         used_units = []
         for rg_id, rg_state in session.rating_groups.items():
             rg_state.local_sequence_number += 1
+
             used_container = {
                 "localSequenceNumber": rg_state.local_sequence_number,
                 "totalVolume": rg_state.used_total_volume,
                 "uplinkVolume": rg_state.used_uplink,
                 "downlinkVolume": rg_state.used_downlink,
+                "quotaManagementIndicator": "ONLINE_CHARGING",
+                "triggerTimestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+                "triggers": [
+                    {
+                        "triggerCategory": "IMMEDIATE_REPORT",
+                        "triggerType": trigger_type,
+                    }
+                ],
             }
             if rg_state.used_time > 0:
                 used_container["time"] = rg_state.used_time
@@ -385,16 +519,12 @@ class ConsumptionEngine:
                 "usedUnitContainer": [used_container],
             }
             if include_requested:
-                entry["requestedUnit"] = {
-                    "totalVolume": 0,
-                    "uplinkVolume": 0,
-                    "downlinkVolume": 0,
-                }
+                entry["requestedUnit"] = {}
             used_units.append(entry)
         return used_units
 
     def _reset_used(self, session: SessionState):
-        """Reset used counters after a successful update."""
+        """Reset used counters after a successful update (cumulative keeps accumulating)."""
         for rg_state in session.rating_groups.values():
             rg_state.used_total_volume = 0
             rg_state.used_uplink = 0

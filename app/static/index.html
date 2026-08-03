@@ -339,8 +339,41 @@
         .log-entry .latency { color: var(--text-secondary); margin-left: auto; }
         .diameter-fields { display: none; }
         .diameter-fields.visible { display: block; }
+        .full-session-fields { display: none; }
+        .full-session-fields.visible { display: block; }
         .tab-content { display: none; }
         .tab-content.active { display: flex; flex-direction: column; gap: 1rem; }
+        .notification-panel {
+            display: none;
+            max-height: 250px;
+            overflow-y: auto;
+        }
+        .notification-panel.visible { display: block; }
+        .notification-panel::-webkit-scrollbar { width: 5px; }
+        .notification-panel::-webkit-scrollbar-thumb { background: var(--bg-card); border-radius: 3px; }
+        .notification-entry {
+            padding: 0.5rem 0.7rem;
+            margin-bottom: 0.4rem;
+            background: var(--bg-card);
+            border-radius: 6px;
+            border-left: 3px solid var(--warning);
+            font-size: 0.8rem;
+        }
+        .notification-entry .notif-time {
+            color: var(--text-secondary);
+            font-size: 0.72rem;
+        }
+        .notification-entry .notif-counter {
+            color: var(--accent);
+            font-weight: 600;
+        }
+        .notification-entry .notif-status {
+            font-weight: 600;
+        }
+        .notification-entry .notif-status.limit-surpassed { color: var(--error); }
+        .notification-entry .notif-status.limit-reached { color: var(--warning); }
+        .notification-entry .notif-status.normal { color: var(--success); }
+        .notification-entry .notif-status.limit-not-surpassed { color: var(--success); }
         input[type="file"] {
             font-size: 0.78rem;
             color: var(--text-secondary);
@@ -366,6 +399,7 @@
             <button data-protocol="sy">Sy</button>
             <button data-protocol="ro">Ro</button>
             <button data-protocol="scapv2">SCAPv2</button>
+            <button data-protocol="full_session" style="border-color: var(--warning); color: var(--warning);">Full Session</button>
         </div>
     </header>
 
@@ -440,6 +474,36 @@
                             <label>Destination-Realm</label>
                             <input type="text" id="destinationRealm" placeholder="operator.com">
                         </div>
+                    </div>
+                </div>
+
+                <!-- Full Session (eN28) fields -->
+                <div class="card full-session-fields" id="fullSessionFields">
+                    <h3>eN28 Spending Limit Control</h3>
+                    <div class="form-group">
+                        <label>eN28 Endpoint (leave blank = same as CHF)</label>
+                        <div class="form-row">
+                            <input type="text" id="en28Fqdn" placeholder="Same as CHF FQDN">
+                            <input type="number" id="en28Port" placeholder="Same as CHF port">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>eN28 Base Path</label>
+                        <input type="text" id="en28BasePath" value="/nchf-spendinglimitcontrol/v1">
+                    </div>
+                    <div class="form-group">
+                        <label>Notification Callback URI (reachable from CHF)</label>
+                        <input type="text" id="notifUri" placeholder="http://your-ip:8080/notifications/spendinglimit">
+                    </div>
+                    <div class="form-group">
+                        <label>Policy Counter IDs (comma-separated)</label>
+                        <input type="text" id="policyCounterIds" placeholder="counter01,counter02" value="1">
+                    </div>
+                    <div class="form-group">
+                        <label><input type="checkbox" id="initialRetrieval" checked> Initial Spending Limit Retrieval</label>
+                    </div>
+                    <div class="form-group">
+                        <label><input type="checkbox" id="enableEn28"> Enable E-N28 (ERICSSON_SLC) — Request Policy Groups via vendorSpecific-000193</label>
                     </div>
                 </div>
 
@@ -603,6 +667,19 @@
                     </div>
                 </div>
             </div>
+
+            <!-- eN28 Notification Panel -->
+            <div class="card notification-panel" id="notificationPanel">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.8rem;">
+                    <h3 style="margin-bottom:0;">eN28 Notifications</h3>
+                    <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="clearNotifications()">Clear</button>
+                </div>
+                <div id="notificationEntries">
+                    <div style="color:var(--text-secondary);font-size:0.8rem;text-align:center;padding:1rem;">
+                        Waiting for spending limit notifications from CHF...
+                    </div>
+                </div>
+            </div>
         </div>
 
         <!-- LOG PANEL -->
@@ -631,6 +708,7 @@
         let latencyData = [];
         let timeLabels = [];
         let responseCodes = {};
+        let isFullSession = false;
 
         // Speed steps for logarithmic-feel slider
         const speedSteps = [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
@@ -669,7 +747,9 @@
                 document.querySelectorAll('.protocol-tabs button').forEach(b => b.classList.remove('active'));
                 e.target.classList.add('active');
                 selectedProtocol = e.target.dataset.protocol;
+                isFullSession = (selectedProtocol === 'full_session');
                 toggleDiameterFields();
+                toggleFullSessionFields();
                 updateDefaultsForProtocol();
             }
         });
@@ -678,12 +758,13 @@
             const basePathEl = document.getElementById('basePath');
             const portEl = document.getElementById('port');
             const defaults = {
-                'chf': { path: '/nchf-convergedcharging/v3', port: '80' },
+                'chf': { path: '/nchf-convergedcharging/v2', port: '80' },
                 'pcf': { path: '/npcf-smpolicycontrol/v1', port: '80' },
                 'scapv2': { path: '/scapv2/charging/v1', port: '80' },
                 'gy': { path: '', port: '3868' },
                 'ro': { path: '', port: '3868' },
                 'sy': { path: '', port: '3868' },
+                'full_session': { path: '/nchf-convergedcharging/v2', port: '80' },
             };
             const d = defaults[selectedProtocol] || defaults['chf'];
             basePathEl.placeholder = d.path;
@@ -692,6 +773,25 @@
             }
             if (!portEl.value || ['80', '443', '3868'].includes(portEl.value)) {
                 portEl.value = d.port;
+            }
+            // Auto-fill notifUri with current host
+            if (isFullSession) {
+                const notifUriEl = document.getElementById('notifUri');
+                if (!notifUriEl.value) {
+                    notifUriEl.value = `http://${window.location.hostname}:${window.location.port || '8080'}/notifications/spendinglimit`;
+                }
+            }
+        }
+
+        function toggleFullSessionFields() {
+            const fullSessionSection = document.getElementById('fullSessionFields');
+            const notifPanel = document.getElementById('notificationPanel');
+            if (isFullSession) {
+                fullSessionSection.classList.add('visible');
+                notifPanel.classList.add('visible');
+            } else {
+                fullSessionSection.classList.remove('visible');
+                notifPanel.classList.remove('visible');
             }
         }
 
@@ -803,6 +903,11 @@
             const ratingGroupsStr = document.getElementById('ratingGroups').value || '1000';
             const ratingGroups = ratingGroupsStr.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
 
+            if (isFullSession) {
+                startFullSession(speed, ratingGroups);
+                return;
+            }
+
             const config = {
                 protocol: selectedProtocol,
                 endpoint: {
@@ -862,9 +967,68 @@
             });
         }
 
+        // ─── Start Full Session (eN28 + CHF) ─────────────────────────────────────
+        function startFullSession(speed, ratingGroups) {
+            const policyCounterIdsStr = document.getElementById('policyCounterIds').value || 'counter01';
+            const policyCounterIds = policyCounterIdsStr.split(',').map(s => s.trim()).filter(s => s);
+
+            const config = {
+                chf_fqdn: document.getElementById('fqdn').value || 'localhost',
+                chf_port: parseInt(document.getElementById('port').value) || 443,
+                chf_base_path: document.getElementById('basePath').value || '/nchf-convergedcharging/v2',
+                chf_secure: document.getElementById('secure').checked,
+                en28_fqdn: document.getElementById('en28Fqdn').value || null,
+                en28_port: document.getElementById('en28Port').value ? parseInt(document.getElementById('en28Port').value) : null,
+                en28_base_path: document.getElementById('en28BasePath').value || '/nchf-spendinglimitcontrol/v1',
+                en28_secure: document.getElementById('secure').checked,
+                notif_uri: document.getElementById('notifUri').value || `http://${window.location.hostname}:${window.location.port || '8080'}/notifications/spendinglimit`,
+                subscriber: {
+                    msisdn: document.getElementById('msisdn').value || '886912345678',
+                    imsi: document.getElementById('imsi').value || '466010000000001',
+                    rating_group: ratingGroups[0] || 1000,
+                    slice_sst: parseInt(document.getElementById('sliceSST').value) || 1,
+                    slice_sd: document.getElementById('sliceSD').value || '000001',
+                    dnn: document.getElementById('dnn').value || 'internet',
+                    apn: document.getElementById('apn').value || 'internet',
+                    mcc: document.getElementById('mcc').value || '466',
+                    mnc: document.getElementById('mnc').value || '01'
+                },
+                policy_counter_ids: policyCounterIds,
+                initial_retrieval: document.getElementById('initialRetrieval').checked,
+                enable_en28: document.getElementById('enableEn28').checked,
+                rating_groups: ratingGroups,
+                speed_mbps: speed,
+                session_duration_sec: parseInt(document.getElementById('sessionDuration').value) || 300,
+                num_sessions: parseInt(document.getElementById('numSessions').value) || 1
+            };
+
+            fetch('/api/traffic/start-full', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(config)
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    setStatus('error');
+                    addLog('SYS', 'Start', 'error', data.error);
+                } else {
+                    setStatus('running');
+                    addLog('eN28', 'Start', 'ok', `Full Session started — eN28 Subscribe + CHF at ${speed} Mbps`);
+                    addLog('eN28', 'Info', 'ok', `Counters: ${policyCounterIds.join(', ')}`);
+                    connectWebSocket();
+                }
+            })
+            .catch(err => {
+                setStatus('error');
+                addLog('SYS', 'Start', 'error', err.message);
+            });
+        }
+
         // ─── Stop Traffic ─────────────────────────────────────────────────────────
         function stopTraffic() {
-            fetch('/api/traffic/stop', { method: 'POST' })
+            const endpoint = isFullSession ? '/api/traffic/stop-full' : '/api/traffic/stop';
+            fetch(endpoint, { method: 'POST' })
                 .then(r => r.json())
                 .then(data => {
                     setStatus('completed');
@@ -903,6 +1067,36 @@
 
         // ─── Update Metrics from WebSocket ────────────────────────────────────────
         function updateMetrics(msg) {
+            // Handle eN28 specific messages
+            if (msg.type === 'en28_notification') {
+                handleNotification(msg);
+                return;
+            }
+            if (msg.type === 'en28_subscribe') {
+                const status = msg.success ? 'ok' : 'error';
+                addLog('eN28', 'Subscribe', status, msg.success ? `Subscription ID: ${msg.subscription_id || 'OK'}` : 'Subscribe failed');
+                return;
+            }
+            if (msg.type === 'en28_unsubscribe') {
+                const status = msg.success ? 'ok' : 'error';
+                addLog('eN28', 'Unsubscribe', status, msg.success ? `${msg.latency_ms.toFixed(0)}ms` : 'Unsubscribe failed');
+                return;
+            }
+            if (msg.type === 'full_session_complete') {
+                setStatus('completed');
+                addLog('eN28', 'Complete', 'ok', `Full session done — ${msg.en28_notifications_received} notification(s) received`);
+                return;
+            }
+            if (msg.type === 'full_session_error') {
+                setStatus('error');
+                addLog('eN28', 'Error', 'error', msg.error);
+                return;
+            }
+            if (msg.type === 'full_session_warning') {
+                addLog('eN28', 'Warning', 'warn', msg.message);
+                return;
+            }
+
             if (msg.speed_mbps !== undefined) document.getElementById('metricSpeed').textContent = msg.speed_mbps.toFixed(1);
             if (msg.total_volume_consumed_mb !== undefined) document.getElementById('metricVolume').textContent = msg.total_volume_consumed_mb.toFixed(2);
             if (msg.total_requests !== undefined) document.getElementById('metricTotal').textContent = msg.total_requests.toLocaleString();
@@ -937,6 +1131,85 @@
             if (msg.log) {
                 addLog(msg.log.protocol || selectedProtocol.toUpperCase(), msg.log.action || 'REQ', msg.log.status || 'ok', msg.log.latency ? `${msg.log.latency}ms` : '');
             }
+        }
+
+        // ─── eN28 Notification Handling ──────────────────────────────────────────
+        function handleNotification(notification) {
+            const container = document.getElementById('notificationEntries');
+            // Remove placeholder text on first notification
+            if (container.querySelector('div[style]')) {
+                container.innerHTML = '';
+            }
+
+            const statusList = notification.statusInfoList || [];
+            const policyGroups = notification.policyGroups || {};
+            const source = notification.source || 'notification';
+            const ts = notification.timestamp || new Date().toISOString();
+
+            // Display Policy Groups if present (E-N28)
+            if (Object.keys(policyGroups).length > 0) {
+                for (const [groupName, groupInfo] of Object.entries(policyGroups)) {
+                    const activationTime = groupInfo.policyGroupActivationTime || '';
+                    const priority = groupInfo.policyGroupPriority || '';
+                    const div = document.createElement('div');
+                    div.className = 'notification-entry';
+                    div.innerHTML = `
+                        <div class="notif-time">${ts} <span style="color:var(--accent);font-size:0.7rem;">[${source}]</span></div>
+                        <div>
+                            <span style="color:#f0a;font-weight:600;">📦 Policy Group:</span>
+                            <span class="notif-counter">${groupName}</span>
+                            <span style="color:var(--text-secondary);font-size:0.72rem;"> priority=${priority} activated=${activationTime.substring(0,19)||'—'}</span>
+                        </div>
+                    `;
+                    container.appendChild(div);
+                }
+            }
+
+            // Display counter statuses
+            for (const entry of statusList) {
+                const counterId = entry.policyCounterId || 'unknown';
+                const currentStatus = entry.currentStatus || 'unknown';
+                const previousStatus = entry.previousStatus || '';
+                const groupName = entry.policyGroupName || '';
+
+                // Determine CSS class for status
+                let statusClass = 'normal';
+                if (currentStatus.toLowerCase().includes('surpassed')) statusClass = 'limit-surpassed';
+                else if (currentStatus.toLowerCase().includes('reached')) statusClass = 'limit-reached';
+                else if (currentStatus.toLowerCase() === 'normal' || currentStatus.toLowerCase().includes('notsurpassed')) statusClass = 'limit-not-surpassed';
+
+                const div = document.createElement('div');
+                div.className = 'notification-entry';
+                div.innerHTML = `
+                    <div class="notif-time">${ts} <span style="color:var(--accent);font-size:0.7rem;">[${source}]</span></div>
+                    <div>
+                        <span class="notif-counter">${counterId}</span>
+                        &rarr; <span class="notif-status ${statusClass}">${currentStatus}</span>
+                        ${groupName ? `<span style="color:#f0a;font-size:0.72rem;"> [${groupName}]</span>` : ''}
+                        ${previousStatus ? `<span style="color:var(--text-secondary);font-size:0.72rem;"> (was: ${previousStatus})</span>` : ''}
+                    </div>
+                `;
+                container.appendChild(div);
+                container.scrollTop = container.scrollHeight;
+            }
+
+            // Also add to log
+            for (const entry of statusList) {
+                const group = entry.policyGroupName ? ` [${entry.policyGroupName}]` : '';
+                addLog('eN28', 'Notify', 'ok', `${entry.policyCounterId}: ${entry.currentStatus}${group}`);
+            }
+            if (Object.keys(policyGroups).length > 0) {
+                addLog('eN28', 'PolicyGroup', 'ok', Object.keys(policyGroups).join(', '));
+            }
+        }
+
+        function clearNotifications() {
+            document.getElementById('notificationEntries').innerHTML = `
+                <div style="color:var(--text-secondary);font-size:0.8rem;text-align:center;padding:1rem;">
+                    Waiting for spending limit notifications from CHF...
+                </div>
+            `;
+            fetch('/api/en28/notifications', { method: 'DELETE' });
         }
 
         // ─── Status indicator ─────────────────────────────────────────────────────
@@ -1069,6 +1342,7 @@
             loadSavedSettings();
             initCharts();
             toggleDiameterFields();
+            toggleFullSessionFields();
         });
     </script>
 </body>

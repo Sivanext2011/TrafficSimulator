@@ -7,8 +7,8 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -18,6 +18,7 @@ from app.protocols.chf import ChfProtocol
 from app.protocols.pcf import PcfProtocol
 from app.protocols.diameter_gy import DiameterGyProtocol
 from app.protocols.diameter_sy import DiameterSyProtocol
+from app.protocols.spending_limit import SpendingLimitClient
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────
 LOG_DIR = Path("/app/logs") if os.path.exists("/app") else Path("logs")
@@ -49,6 +50,11 @@ CERT_DIR.mkdir(parents=True, exist_ok=True)
 # Global state
 consumption_engine = ConsumptionEngine()
 connected_clients: List[WebSocket] = []
+
+# eN28 notification storage
+en28_notifications: List[dict] = []
+en28_spending_limit_client: Optional[SpendingLimitClient] = None
+full_session_task: Optional[asyncio.Task] = None
 
 
 # ─── Session Handler Wrappers ─────────────────────────────────────────────────
@@ -873,6 +879,430 @@ async def clear_logs():
     with open(LOG_FILE, "w", encoding="utf-8") as f:
         f.write("")
     return {"status": "logs cleared"}
+
+
+# ─── eN28 Notification Callback ───────────────────────────────────────────────
+
+@app.post("/notifications/spendinglimit")
+async def en28_notification_callback(request: Request):
+    """Receive spending limit notifications from CHF (eN28).
+
+    The CHF POSTs SpendingLimitStatus here when a policy counter status changes.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    notification = {
+        "timestamp": timestamp,
+        "body": body,
+        "supi": body.get("supi", ""),
+        "statusInfoList": [],
+    }
+
+    # Extract statusInfoList from various possible response formats
+    spending_status = body.get("spendingLimitStatus", body)
+    status_list = spending_status.get("statusInfoList", [])
+    notification["statusInfoList"] = status_list
+
+    en28_notifications.append(notification)
+    # Keep last 100 notifications
+    if len(en28_notifications) > 100:
+        en28_notifications.pop(0)
+
+    logger.info(f"<<< eN28 NOTIFICATION RECEIVED: {len(status_list)} counter(s)")
+    for entry in status_list:
+        counter_id = entry.get("policyCounterId", "unknown")
+        current = entry.get("currentStatus", "unknown")
+        previous = entry.get("previousStatus", "")
+        logger.info(f"    Counter '{counter_id}': {previous} → {current}")
+
+    # Broadcast to WebSocket clients
+    await broadcast_metrics({
+        "type": "en28_notification",
+        "notification": notification,
+    })
+
+    return Response(status_code=204)
+
+
+@app.get("/api/en28/notifications")
+async def get_en28_notifications():
+    """Get all received eN28 notifications."""
+    return {"notifications": en28_notifications}
+
+
+@app.delete("/api/en28/notifications")
+async def clear_en28_notifications():
+    """Clear all stored eN28 notifications."""
+    en28_notifications.clear()
+    return {"status": "cleared"}
+
+
+# ─── Full Session Mode (eN28 + Nchf_ConvergedCharging) ───────────────────────
+
+class FullSessionConfig(BaseModel):
+    """Configuration for Full Session mode: eN28 Subscribe → CHF → Unsubscribe."""
+    # CHF endpoint (Nchf_ConvergedCharging)
+    chf_fqdn: str
+    chf_port: int = 443
+    chf_base_path: str = "/nchf-convergedcharging/v2"
+    chf_secure: bool = True
+
+    # eN28 endpoint (Nchf_SpendingLimitControl) - can be same or different host
+    en28_fqdn: Optional[str] = None  # defaults to chf_fqdn if not set
+    en28_port: Optional[int] = None  # defaults to chf_port if not set
+    en28_base_path: str = "/nchf-spendinglimitcontrol/v1"
+    en28_secure: bool = True
+
+    # Callback URI for eN28 notifications (must be reachable from CHF)
+    notif_uri: str = "http://localhost:8080/notifications/spendinglimit"
+
+    # Subscriber
+    subscriber: SubscriberConfig = SubscriberConfig()
+
+    # Spending limit config
+    policy_counter_ids: List[str] = ["counter01"]
+    initial_retrieval: bool = True
+    enable_en28: bool = False  # If True, use Ericsson E-N28 extension (vendorSpecific-000193) for Policy Groups
+
+    # Charging session config
+    rating_groups: List[int] = [1000]
+    speed_mbps: float = 10.0
+    session_duration_sec: int = 300
+    num_sessions: int = 1
+
+
+@app.post("/api/traffic/start-full")
+async def start_full_session(config: FullSessionConfig):
+    """Start a Full Session: eN28 Subscribe → CHF Create → Consume → Release → Unsubscribe."""
+    global en28_spending_limit_client, full_session_task
+
+    try:
+        # Stop any existing session
+        if full_session_task and not full_session_task.done():
+            await stop_full_session_internal()
+
+        # Clear previous notifications
+        en28_notifications.clear()
+
+        # Resolve cert paths
+        cert_profile = CERT_DIR / "default"
+        cert_path = str(cert_profile / "client.crt") if (cert_profile / "client.crt").exists() else None
+        key_path = str(cert_profile / "client.key") if (cert_profile / "client.key").exists() else None
+
+        # Resolve eN28 endpoint (defaults to CHF if not specified)
+        en28_fqdn = config.en28_fqdn or config.chf_fqdn
+        en28_port = config.en28_port or config.chf_port
+
+        # Create spending limit client
+        en28_spending_limit_client = SpendingLimitClient(
+            fqdn=en28_fqdn,
+            port=en28_port,
+            base_path=config.en28_base_path,
+            cert_path=cert_path,
+            key_path=key_path,
+            secure=config.en28_secure,
+            verify_ssl=False,
+        )
+
+        # Create CHF session handler
+        chf_fqdn = config.chf_fqdn.strip()
+        if chf_fqdn.startswith("http://"):
+            chf_fqdn = chf_fqdn[7:]
+        elif chf_fqdn.startswith("https://"):
+            chf_fqdn = chf_fqdn[8:]
+        chf_fqdn = chf_fqdn.rstrip("/")
+
+        chf_handler = ChfSessionHandler(
+            fqdn=chf_fqdn,
+            port=config.chf_port,
+            base_path=config.chf_base_path,
+            cert_path=cert_path,
+            key_path=key_path,
+            ca_path=None,
+            subscriber=config.subscriber.model_dump(),
+            secure=config.chf_secure,
+            verify_ssl=False,
+        )
+
+        # Build subscriber identifiers
+        sub = config.subscriber
+        supi = f"imsi-{sub.imsi}"
+        gpsi = f"msisdn-{sub.msisdn}"
+
+        # Check notifUri reachability — warn if localhost
+        notif_uri = config.notif_uri
+        notif_uri_warning = None
+        if "localhost" in notif_uri or "127.0.0.1" in notif_uri:
+            # Try to detect a routable local IP
+            import socket
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect((en28_fqdn, en28_port))
+                local_ip = s.getsockname()[0]
+                s.close()
+                suggested_uri = notif_uri.replace("localhost", local_ip).replace("127.0.0.1", local_ip)
+                notif_uri_warning = (
+                    f"WARNING: notifUri uses localhost — CHF cannot reach your simulator. "
+                    f"Suggested: {suggested_uri}"
+                )
+                logger.warning(notif_uri_warning)
+            except Exception:
+                notif_uri_warning = "WARNING: notifUri uses localhost — CHF cannot send notifications back to your simulator"
+                logger.warning(notif_uri_warning)
+
+            # Broadcast the warning to the UI
+            await broadcast_metrics({
+                "type": "full_session_warning",
+                "message": notif_uri_warning,
+            })
+
+        # Start the full session orchestration as a background task
+        full_session_task = asyncio.create_task(
+            _run_full_session(
+                slc_client=en28_spending_limit_client,
+                chf_handler=chf_handler,
+                supi=supi,
+                gpsi=gpsi,
+                notif_uri=config.notif_uri,
+                policy_counter_ids=config.policy_counter_ids,
+                initial_retrieval=config.initial_retrieval,
+                enable_en28=config.enable_en28,
+                rating_groups=config.rating_groups,
+                speed_mbps=config.speed_mbps,
+                session_duration_sec=config.session_duration_sec,
+                num_sessions=config.num_sessions,
+            )
+        )
+
+        response = {
+            "status": "started",
+            "mode": "full_session",
+            "en28_endpoint": f"{'https' if config.en28_secure else 'http'}://{en28_fqdn}:{en28_port}{config.en28_base_path}",
+            "chf_endpoint": f"{'https' if config.chf_secure else 'http'}://{chf_fqdn}:{config.chf_port}{config.chf_base_path}",
+            "notif_uri": notif_uri,
+            "policy_counter_ids": config.policy_counter_ids,
+            "rating_groups": config.rating_groups,
+        }
+        if notif_uri_warning:
+            response["warning"] = notif_uri_warning
+        return response
+
+    except Exception as e:
+        import traceback
+        logger.error(f"start_full_session error: {traceback.format_exc()}")
+        return {"error": str(e)}
+
+
+@app.post("/api/traffic/stop-full")
+async def stop_full_session():
+    """Stop the full session orchestration."""
+    await stop_full_session_internal()
+    return {"status": "stopped"}
+
+
+async def stop_full_session_internal():
+    """Internal helper to stop the full session."""
+    global full_session_task, en28_spending_limit_client
+
+    # Stop the consumption engine first
+    await consumption_engine.stop()
+
+    # Cancel the orchestration task
+    if full_session_task and not full_session_task.done():
+        full_session_task.cancel()
+        try:
+            await asyncio.wait_for(full_session_task, timeout=10.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        full_session_task = None
+
+    # Unsubscribe from eN28 (only if still subscribed — avoids double-unsubscribe)
+    if en28_spending_limit_client and en28_spending_limit_client.is_subscribed:
+        try:
+            success, latency = await en28_spending_limit_client.unsubscribe()
+            logger.info(f"eN28 unsubscribe on stop: success={success}, latency={latency:.1f}ms")
+        except Exception as e:
+            logger.error(f"Failed to unsubscribe on stop: {e}")
+    else:
+        logger.info("eN28: already unsubscribed or no client — skipping")
+
+    # Close the client
+    if en28_spending_limit_client:
+        await en28_spending_limit_client.close()
+        en28_spending_limit_client = None
+
+
+async def _run_full_session(
+    slc_client: SpendingLimitClient,
+    chf_handler,
+    supi: str,
+    gpsi: str,
+    notif_uri: str,
+    policy_counter_ids: List[str],
+    initial_retrieval: bool,
+    enable_en28: bool,
+    rating_groups: List[int],
+    speed_mbps: float,
+    session_duration_sec: int,
+    num_sessions: int,
+):
+    """Orchestrate the full session lifecycle:
+    1. eN28 Subscribe (spending limit)
+    2. CHF Create → Consume → Updates → Release
+    3. eN28 Unsubscribe
+    """
+    try:
+        # === PHASE 1: eN28 Subscribe ===
+        logger.info("=" * 60)
+        logger.info("FULL SESSION: Phase 1 — eN28 Subscribe")
+        logger.info("=" * 60)
+
+        success, latency, initial_status = await slc_client.subscribe(
+            supi=supi,
+            gpsi=gpsi,
+            notif_uri=notif_uri,
+            policy_counter_ids=policy_counter_ids,
+            initial_retrieval=initial_retrieval,
+            enable_en28=enable_en28,
+        )
+
+        # Broadcast subscription result
+        await broadcast_metrics({
+            "type": "en28_subscribe",
+            "success": success,
+            "latency_ms": latency,
+            "subscription_id": slc_client.subscription_id,
+            "initial_status": initial_status,
+        })
+
+        if not success:
+            logger.warning("eN28 Subscribe failed — continuing with CHF session only (degraded mode)")
+
+        # If initial status was returned, store as a notification
+        # Handle three formats:
+        #   Standard N28: {"statusInfos": {"counterId": {"policyCounterId": "x", "currentStatus": "y"}}}
+        #   3GPP: {"spendingLimitStatus": {"statusInfoList": [...]}}
+        #   E-N28: {"vendorSpecific-000193": {"policyCounters": [...], "policyGroups": {...}}}
+        if initial_status:
+            status_info_list = []
+            policy_groups = {}
+            policy_counters_en28 = []
+
+            # Try E-N28 format: vendorSpecific-000193 with policyGroups and policyCounters
+            vendor_block = initial_status.get("vendorSpecific-000193")
+            if vendor_block and isinstance(vendor_block, dict):
+                policy_counters_en28 = vendor_block.get("policyCounters", [])
+                policy_groups = vendor_block.get("policyGroups", {})
+
+                for pc in policy_counters_en28:
+                    status_info_list.append({
+                        "policyCounterId": pc.get("policyCounterIdentifier", ""),
+                        "currentStatus": pc.get("policyCounterStatus", "UNKNOWN"),
+                        "policyGroupName": pc.get("policyGroupName", ""),
+                    })
+                logger.info(f"    E-N28 Policy Counters: {policy_counters_en28}")
+                logger.info(f"    E-N28 Policy Groups: {policy_groups}")
+
+            # Try Ericsson CHA standard format: {"statusInfos": {"1": {...}, "2": {...}}}
+            elif "statusInfos" in initial_status:
+                status_infos = initial_status["statusInfos"]
+                if isinstance(status_infos, dict):
+                    for counter_id, info in status_infos.items():
+                        status_info_list.append({
+                            "policyCounterId": info.get("policyCounterId", counter_id),
+                            "currentStatus": info.get("currentStatus", "UNKNOWN"),
+                        })
+                    logger.info(f"    Initial counter status (Ericsson format): {status_info_list}")
+
+            # Try 3GPP standard format: {"spendingLimitStatus": {"statusInfoList": [...]}}
+            elif "spendingLimitStatus" in initial_status:
+                sls = initial_status["spendingLimitStatus"]
+                if isinstance(sls, dict):
+                    status_info_list = sls.get("statusInfoList", [])
+                    logger.info(f"    Initial counter status (3GPP format): {status_info_list}")
+
+            if status_info_list or policy_groups:
+                notification_entry = {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "body": initial_status,
+                    "supi": supi,
+                    "statusInfoList": status_info_list,
+                    "policyGroups": policy_groups,
+                    "source": "initial_retrieval",
+                }
+                en28_notifications.append(notification_entry)
+
+                # Emit WebSocket event so UI shows it immediately
+                await broadcast_metrics({
+                    "type": "en28_notification",
+                    "source": "initial_retrieval",
+                    "supi": supi,
+                    "statusInfoList": status_info_list,
+                    "policyGroups": policy_groups,
+                    "subscription_id": slc_client.subscription_id,
+                })
+
+        # === PHASE 2: CHF Charging Session ===
+        logger.info("=" * 60)
+        logger.info("FULL SESSION: Phase 2 — CHF Converged Charging")
+        logger.info("=" * 60)
+
+        await consumption_engine.start(
+            protocol=chf_handler,
+            speed_mbps=speed_mbps,
+            num_sessions=num_sessions,
+            rating_groups=rating_groups,
+            session_duration_sec=session_duration_sec,
+            metrics_callback=broadcast_metrics,
+        )
+
+        # Wait for the consumption engine to complete
+        while consumption_engine._running:
+            await asyncio.sleep(1.0)
+
+        # === PHASE 3: eN28 Unsubscribe ===
+        logger.info("=" * 60)
+        logger.info("FULL SESSION: Phase 3 — eN28 Unsubscribe")
+        logger.info("=" * 60)
+
+        if slc_client.is_subscribed:
+            success, latency = await slc_client.unsubscribe()
+            await broadcast_metrics({
+                "type": "en28_unsubscribe",
+                "success": success,
+                "latency_ms": latency,
+            })
+
+        logger.info("=" * 60)
+        logger.info("FULL SESSION: Complete")
+        logger.info("=" * 60)
+
+        await broadcast_metrics({
+            "type": "full_session_complete",
+            "en28_notifications_received": len(en28_notifications),
+        })
+
+    except asyncio.CancelledError:
+        logger.info("Full session cancelled — cleaning up")
+        # Don't unsubscribe here — stop_full_session_internal() handles it
+        # to avoid the double-unsubscribe race condition
+        pass
+    except Exception as e:
+        logger.error(f"Full session error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        await broadcast_metrics({
+            "type": "full_session_error",
+            "error": str(e),
+        })
+    finally:
+        await chf_handler.close()
+        await slc_client.close()
 
 
 # ─── WebSocket for live metrics ───────────────────────────────────────────────
