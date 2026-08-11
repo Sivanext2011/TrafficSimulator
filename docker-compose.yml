@@ -7,6 +7,8 @@ services:
       - "8080:8080"
     volumes:
       - ./certs:/app/certs
+      - ./logs:/app/logs
+      - ./config:/app/config
     environment:
       - LOG_LEVEL=info
     restart: unless-stopped

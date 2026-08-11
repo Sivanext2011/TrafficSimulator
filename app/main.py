@@ -21,11 +21,15 @@ from app.protocols.diameter_sy import DiameterSyProtocol
 from app.protocols.spending_limit import SpendingLimitClient
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────
+from logging.handlers import RotatingFileHandler
+
 LOG_DIR = Path("/app/logs") if os.path.exists("/app") else Path("logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "simulator.log"
 
-file_handler = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+file_handler = RotatingFileHandler(
+    LOG_FILE, mode="a", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+)
 file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
 file_handler.setLevel(logging.DEBUG)
 
@@ -34,12 +38,12 @@ console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(na
 console_handler.setLevel(logging.INFO)
 
 logging.basicConfig(level=logging.DEBUG, handlers=[file_handler, console_handler])
+
 from app.protocols.diameter_ro import DiameterRoProtocol
 from app.protocols.scapv2 import ScapV2Protocol
 
 import httpx
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Telecom Traffic Simulator", version="2.0.0")
@@ -672,6 +676,38 @@ class ControlCommand(BaseModel):
 
 # ─── API Routes ───────────────────────────────────────────────────────────────
 
+@app.get("/health")
+async def health():
+    """Health check endpoint for Docker HEALTHCHECK."""
+    return {"status": "ok", "version": app.version}
+
+
+# ─── Server-side Settings Persistence ─────────────────────────────────────────
+SETTINGS_DIR = Path("/app/config") if os.path.exists("/app") else Path("config")
+SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+SETTINGS_FILE = SETTINGS_DIR / "settings.json"
+
+
+@app.get("/api/settings")
+async def get_settings():
+    """Retrieve all saved settings from server-side storage."""
+    if SETTINGS_FILE.exists():
+        try:
+            return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, IOError):
+            return {}
+    return {}
+
+
+@app.post("/api/settings")
+async def save_settings(request: Request):
+    """Save settings to server-side storage (persists across container restarts)."""
+    data = await request.json()
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return {"status": "saved"}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html_path = Path(__file__).parent / "static" / "index.html"
@@ -863,6 +899,26 @@ async def get_metrics():
     return consumption_engine.get_metrics()
 
 
+@app.post("/api/metrics/reset")
+async def reset_metrics():
+    """Reset all metrics counters to zero."""
+    consumption_engine._metrics = {
+        "total_requests": 0,
+        "successful": 0,
+        "failed": 0,
+        "active_sessions": 0,
+        "current_tps": 0.0,
+        "avg_latency_ms": 0.0,
+        "speed_mbps": consumption_engine._speed_mbps,
+        "total_volume_consumed_mb": 0.0,
+        "state": "idle",
+        "protocol": None,
+    }
+    consumption_engine._latencies.clear()
+    consumption_engine._request_times.clear()
+    return {"status": "metrics reset"}
+
+
 @app.get("/api/logs", response_class=PlainTextResponse)
 async def get_logs(lines: int = 100):
     """View the last N lines of the application log."""
@@ -873,7 +929,67 @@ async def get_logs(lines: int = 100):
     return "".join(all_lines[-lines:])
 
 
-@app.get("/api/logs/clear")
+@app.post("/api/test-connection")
+async def test_connection(config: EndpointConfig):
+    """Test connectivity to the configured endpoint.
+
+    For SBI protocols: attempts an HTTP HEAD/GET to the endpoint.
+    For Diameter protocols: attempts a TCP connection.
+    """
+    import socket
+
+    fqdn = config.fqdn.strip()
+    if fqdn.startswith("http://"):
+        fqdn = fqdn[7:]
+    elif fqdn.startswith("https://"):
+        fqdn = fqdn[8:]
+    fqdn = fqdn.rstrip("/")
+
+    protocol = config.protocol.lower()
+    start = time.perf_counter()
+
+    if protocol in ("gy", "ro", "sy"):
+        # TCP connection test for Diameter
+        try:
+            sock = socket.create_connection((fqdn, config.port), timeout=5)
+            latency_ms = (time.perf_counter() - start) * 1000
+            sock.close()
+            return {
+                "status": "ok",
+                "message": f"TCP connection to {fqdn}:{config.port} successful",
+                "latency_ms": round(latency_ms, 1),
+            }
+        except socket.timeout:
+            return {"status": "error", "message": f"Connection to {fqdn}:{config.port} timed out (5s)"}
+        except socket.gaierror:
+            return {"status": "error", "message": f"DNS resolution failed for {fqdn}"}
+        except OSError as e:
+            return {"status": "error", "message": f"Connection failed: {e}"}
+    else:
+        # HTTP connection test for SBI protocols
+        scheme = "https" if config.secure else "http"
+        base_path = (config.base_path or "").rstrip("/")
+        url = f"{scheme}://{fqdn}:{config.port}{base_path}"
+
+        try:
+            async with httpx.AsyncClient(verify=False, timeout=5.0) as client:
+                resp = await client.get(url)
+                latency_ms = (time.perf_counter() - start) * 1000
+                return {
+                    "status": "ok",
+                    "message": f"HTTP {resp.status_code} from {url}",
+                    "latency_ms": round(latency_ms, 1),
+                    "http_status": resp.status_code,
+                }
+        except httpx.ConnectTimeout:
+            return {"status": "error", "message": f"Connection to {url} timed out (5s)"}
+        except httpx.ConnectError as e:
+            return {"status": "error", "message": f"Connection failed: {e}"}
+        except Exception as e:
+            return {"status": "error", "message": f"Error: {e}"}
+
+
+@app.post("/api/logs/clear")
 async def clear_logs():
     """Clear the log file."""
     with open(LOG_FILE, "w", encoding="utf-8") as f:

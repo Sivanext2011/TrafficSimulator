@@ -440,6 +440,8 @@
                             <label><input type="checkbox" id="verifySsl"> Verify SSL</label>
                         </div>
                     </div>
+                    <button class="btn" style="background:var(--bg-card);color:var(--accent);width:100%;margin-top:0.5rem;border:1px solid var(--accent);" onclick="testConnection()">&#128268; Test Connection</button>
+                    <div id="connTestResult" style="display:none;margin-top:0.5rem;font-size:0.8rem;padding:0.4rem 0.7rem;border-radius:6px;"></div>
                 </div>
 
                 <!-- Diameter-specific fields -->
@@ -526,6 +528,12 @@
 
                 <div class="card">
                     <button class="btn btn-save" onclick="saveSettings()">&#128190; Save Settings</button>
+                    <div style="display:flex; gap:0.5rem; margin-top:0.5rem;">
+                        <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.75rem;padding:0.4rem 0.8rem;flex:1;" onclick="exportSettings()">&#11015; Export Config</button>
+                        <label class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.75rem;padding:0.4rem 0.8rem;flex:1;text-align:center;cursor:pointer;">&#11014; Import Config
+                            <input type="file" accept=".json" style="display:none;" onchange="importSettings(event)">
+                        </label>
+                    </div>
                     <div class="save-indicator" id="saveIndicator">
                         <span class="checkmark">&#10004;</span>
                         <span>Settings Saved</span>
@@ -615,9 +623,12 @@
             <div class="card">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
                     <h3 style="margin-bottom:0;">Live Metrics</h3>
-                    <div class="status-indicator status-idle" id="statusIndicator">
-                        <span class="dot"></span>
-                        <span id="statusText">IDLE</span>
+                    <div style="display:flex; align-items:center; gap:0.6rem;">
+                        <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="resetMetrics()" title="Reset all counters">&#128260; Reset</button>
+                        <div class="status-indicator status-idle" id="statusIndicator">
+                            <span class="dot"></span>
+                            <span id="statusText">IDLE</span>
+                        </div>
                     </div>
                 </div>
                 <div class="counters-grid">
@@ -684,7 +695,14 @@
 
         <!-- LOG PANEL -->
         <div class="card log-panel">
-            <h3>Request Log</h3>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
+                <h3 style="margin-bottom:0;">Request Log</h3>
+                <div style="display:flex; gap:0.4rem;">
+                    <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="viewServerLog()" title="View full server log">&#128196; Server Log</button>
+                    <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="exportLog()" title="Export log to file">&#11015; Export</button>
+                    <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="clearLog()" title="Clear all logs">&#128465; Clear</button>
+                </div>
+            </div>
             <div class="log-entries" id="logEntries">
                 <div class="log-entry">
                     <span class="ts">--:--:--</span>
@@ -716,19 +734,21 @@
         const sbiProtocols = ['chf', 'pcf', 'scapv2'];
 
         // ─── Integration field IDs and their localStorage keys ───────────────────
-        const integrationFields = {
-            'fqdn': 'sim_fqdn',
-            'port': 'sim_port',
-            'basePath': 'sim_basePath',
-            'secure': 'sim_secure',
-            'verifySsl': 'sim_verifySsl',
-            'diameterHost': 'sim_diameterHost',
-            'diameterPort': 'sim_diameterPort',
-            'originHost': 'sim_originHost',
-            'originRealm': 'sim_originRealm',
-            'destinationHost': 'sim_destinationHost',
-            'destinationRealm': 'sim_destinationRealm'
-        };
+        // All persistable fields across both tabs
+        const allFieldIds = [
+            // Integration tab - Endpoint
+            'fqdn', 'port', 'basePath', 'secure', 'verifySsl',
+            // Diameter fields
+            'diameterHost', 'diameterPort', 'originHost', 'originRealm',
+            'destinationHost', 'destinationRealm',
+            // eN28 fields
+            'en28Fqdn', 'en28Port', 'en28BasePath', 'notifUri',
+            'policyCounterIds', 'initialRetrieval', 'enableEn28',
+            // Subscriber fields
+            'msisdn', 'imsi', 'sliceSST', 'sliceSD', 'dnn', 'apn', 'mcc', 'mnc',
+            // Traffic fields
+            'ratingGroups', 'sessionDuration', 'numSessions', 'speedSlider',
+        ];
 
         // ─── Sub-Tabs (Integration / Traffic) ────────────────────────────────────
         document.getElementById('subTabs').addEventListener('click', (e) => {
@@ -750,6 +770,7 @@
                 isFullSession = (selectedProtocol === 'full_session');
                 toggleDiameterFields();
                 toggleFullSessionFields();
+                loadSavedSettings(); // Load per-protocol saved settings
                 updateDefaultsForProtocol();
             }
         });
@@ -804,17 +825,36 @@
             }
         }
 
-        // ─── Save / Load Settings (localStorage) ─────────────────────────────────
+        // ─── Save / Load Settings (localStorage, per-protocol) ─────────────────────
         function saveSettings() {
-            for (const [fieldId, storageKey] of Object.entries(integrationFields)) {
+            const settings = {};
+            for (const fieldId of allFieldIds) {
                 const el = document.getElementById(fieldId);
                 if (!el) continue;
                 if (el.type === 'checkbox') {
-                    localStorage.setItem(storageKey, el.checked ? 'true' : 'false');
+                    settings[fieldId] = el.checked;
                 } else {
-                    localStorage.setItem(storageKey, el.value);
+                    settings[fieldId] = el.value;
                 }
             }
+            // Save per-protocol to localStorage
+            localStorage.setItem(`sim_settings_${selectedProtocol}`, JSON.stringify(settings));
+            // Also save the last selected protocol
+            localStorage.setItem('sim_lastProtocol', selectedProtocol);
+
+            // Persist to server (survives browser cache clears)
+            const allSettings = {};
+            for (const proto of ['chf', 'pcf', 'gy', 'sy', 'ro', 'scapv2', 'full_session']) {
+                const saved = localStorage.getItem(`sim_settings_${proto}`);
+                if (saved) allSettings[proto] = JSON.parse(saved);
+            }
+            allSettings._lastProtocol = selectedProtocol;
+            fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(allSettings)
+            }).catch(() => {}); // fire-and-forget
+
             // Show saved indicator
             const indicator = document.getElementById('saveIndicator');
             indicator.classList.add('visible');
@@ -822,17 +862,78 @@
         }
 
         function loadSavedSettings() {
-            for (const [fieldId, storageKey] of Object.entries(integrationFields)) {
-                const saved = localStorage.getItem(storageKey);
-                if (saved === null) continue;
-                const el = document.getElementById(fieldId);
-                if (!el) continue;
-                if (el.type === 'checkbox') {
-                    el.checked = (saved === 'true');
-                } else {
-                    el.value = saved;
-                }
+            const saved = localStorage.getItem(`sim_settings_${selectedProtocol}`);
+            if (saved) {
+                applySettings(JSON.parse(saved));
+                return;
             }
+            // Fallback: try loading from server
+            fetch('/api/settings')
+                .then(r => r.json())
+                .then(allSettings => {
+                    if (allSettings[selectedProtocol]) {
+                        const settings = allSettings[selectedProtocol];
+                        localStorage.setItem(`sim_settings_${selectedProtocol}`, JSON.stringify(settings));
+                        applySettings(settings);
+                    }
+                })
+                .catch(() => {}); // ignore if server unavailable
+        }
+
+        function applySettings(settings) {
+            try {
+                for (const [fieldId, value] of Object.entries(settings)) {
+                    const el = document.getElementById(fieldId);
+                    if (!el) continue;
+                    if (el.type === 'checkbox') {
+                        el.checked = !!value;
+                    } else {
+                        el.value = value;
+                    }
+                }
+                // Update speed display if slider was loaded
+                if (settings.speedSlider !== undefined) {
+                    updateSpeedDisplay();
+                }
+            } catch (e) { /* ignore parse errors */ }
+        }
+
+        function exportSettings() {
+            const allSettings = {};
+            // Gather settings for all protocols
+            for (const proto of ['chf', 'pcf', 'gy', 'sy', 'ro', 'scapv2', 'full_session']) {
+                const saved = localStorage.getItem(`sim_settings_${proto}`);
+                if (saved) allSettings[proto] = JSON.parse(saved);
+            }
+            const blob = new Blob([JSON.stringify(allSettings, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `simulator-config-${new Date().toISOString().slice(0,10)}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+            addLog('SYS', 'Config', 'ok', 'Settings exported');
+        }
+
+        function importSettings(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                try {
+                    const allSettings = JSON.parse(e.target.result);
+                    for (const [proto, settings] of Object.entries(allSettings)) {
+                        localStorage.setItem(`sim_settings_${proto}`, JSON.stringify(settings));
+                    }
+                    // Reload current protocol settings
+                    loadSavedSettings();
+                    addLog('SYS', 'Config', 'ok', 'Settings imported');
+                } catch (err) {
+                    addLog('SYS', 'Config', 'error', 'Invalid config file');
+                }
+            };
+            reader.readAsText(file);
+            event.target.value = ''; // reset file input
         }
 
 
@@ -1039,13 +1140,19 @@
 
 
         // ─── WebSocket Connection ─────────────────────────────────────────────────
+        let wsRetryCount = 0;
+        const WS_MAX_RETRY_DELAY = 30000; // 30s max
+
         function connectWebSocket() {
             if (ws && ws.readyState === WebSocket.OPEN) return;
 
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${protocol}//${window.location.host}/ws/metrics`);
 
-            ws.onopen = () => addLog('SYS', 'WS', 'ok', 'Connected to metrics stream');
+            ws.onopen = () => {
+                wsRetryCount = 0; // reset backoff on successful connection
+                addLog('SYS', 'WS', 'ok', 'Connected to metrics stream');
+            };
 
             ws.onmessage = (event) => {
                 try {
@@ -1056,10 +1163,13 @@
 
             ws.onclose = () => {
                 addLog('SYS', 'WS', 'error', 'Disconnected');
-                setTimeout(() => {
-                    const status = document.getElementById('statusText').textContent.toLowerCase();
-                    if (status === 'running') connectWebSocket();
-                }, 3000);
+                const status = document.getElementById('statusText').textContent.toLowerCase();
+                if (status === 'running') {
+                    wsRetryCount++;
+                    const delay = Math.min(1000 * Math.pow(2, wsRetryCount - 1), WS_MAX_RETRY_DELAY);
+                    addLog('SYS', 'WS', 'error', `Reconnecting in ${(delay/1000).toFixed(0)}s...`);
+                    setTimeout(connectWebSocket, delay);
+                }
             };
 
             ws.onerror = () => {};
@@ -1337,12 +1447,134 @@
             responseChart.update();
         }
 
+        // ─── Log Control Functions ────────────────────────────────────────────────
+        function clearLog() {
+            document.getElementById('logEntries').innerHTML = '';
+            fetch('/api/logs/clear', { method: 'POST' })
+                .then(() => addLog('SYS', 'Log', 'ok', 'Logs cleared'))
+                .catch(err => addLog('SYS', 'Log', 'error', err.message));
+        }
+
+        function viewServerLog() {
+            fetch('/api/logs?lines=500')
+                .then(r => r.text())
+                .then(text => {
+                    const win = window.open('', '_blank');
+                    win.document.write('<html><head><title>Simulator Server Log</title></head><body>');
+                    win.document.write('<pre style="background:#1a1a2e;color:#eaeaea;padding:1rem;margin:0;min-height:100vh;font-family:Consolas,monospace;font-size:0.85rem;white-space:pre-wrap;word-wrap:break-word;">');
+                    win.document.write(text.replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+                    win.document.write('</pre></body></html>');
+                    win.document.close();
+                })
+                .catch(err => addLog('SYS', 'Log', 'error', err.message));
+        }
+
+        function exportLog() {
+            fetch('/api/logs?lines=10000')
+                .then(r => r.text())
+                .then(text => {
+                    const blob = new Blob([text], { type: 'text/plain' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'simulator-log-' + new Date().toISOString().slice(0,19).replace(/:/g, '-') + '.txt';
+                    a.click();
+                    URL.revokeObjectURL(url);
+                    addLog('SYS', 'Log', 'ok', 'Log exported');
+                })
+                .catch(err => addLog('SYS', 'Log', 'error', err.message));
+        }
+
+        // ─── Metrics Reset ────────────────────────────────────────────────────────
+        function resetMetrics() {
+            fetch('/api/metrics/reset', { method: 'POST' })
+                .then(r => r.json())
+                .then(() => {
+                    // Reset UI counters
+                    document.getElementById('metricTotal').textContent = '0';
+                    document.getElementById('metricSuccess').textContent = '0';
+                    document.getElementById('metricFailed').textContent = '0';
+                    document.getElementById('metricSessions').textContent = '0';
+                    document.getElementById('metricTPS').textContent = '0.0';
+                    document.getElementById('metricLatency').textContent = '0';
+                    document.getElementById('metricVolume').textContent = '0.0';
+                    // Reset chart data
+                    tpsData.length = 0;
+                    latencyData.length = 0;
+                    timeLabels.length = 0;
+                    responseCodes = {};
+                    if (tpsChart) tpsChart.update();
+                    if (responseChart) {
+                        responseChart.data.labels = [];
+                        responseChart.data.datasets[0].data = [];
+                        responseChart.update();
+                    }
+                    setStatus('idle');
+                    addLog('SYS', 'Metrics', 'ok', 'Counters reset');
+                })
+                .catch(err => addLog('SYS', 'Metrics', 'error', err.message));
+        }
+
+        // ─── Connection Test ──────────────────────────────────────────────────────
+        function testConnection() {
+            const resultDiv = document.getElementById('connTestResult');
+            resultDiv.style.display = 'block';
+            resultDiv.style.background = 'var(--bg-card)';
+            resultDiv.style.color = 'var(--text-secondary)';
+            resultDiv.textContent = 'Testing connection...';
+
+            const config = {
+                protocol: selectedProtocol === 'full_session' ? 'chf' : selectedProtocol,
+                fqdn: document.getElementById('fqdn').value || 'localhost',
+                port: parseInt(document.getElementById('port').value) || 443,
+                base_path: document.getElementById('basePath').value || '',
+                secure: document.getElementById('secure').checked,
+                verify_ssl: document.getElementById('verifySsl').checked,
+            };
+
+            fetch('/api/test-connection', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(config)
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.status === 'ok') {
+                    resultDiv.style.background = 'rgba(76,175,80,0.15)';
+                    resultDiv.style.color = 'var(--success)';
+                    resultDiv.textContent = '\u2714 ' + data.message + ' (' + data.latency_ms + 'ms)';
+                } else {
+                    resultDiv.style.background = 'rgba(244,67,54,0.15)';
+                    resultDiv.style.color = 'var(--error)';
+                    resultDiv.textContent = '\u2718 ' + data.message;
+                }
+                addLog('SYS', 'Test', data.status === 'ok' ? 'ok' : 'error', data.message);
+            })
+            .catch(err => {
+                resultDiv.style.background = 'rgba(244,67,54,0.15)';
+                resultDiv.style.color = 'var(--error)';
+                resultDiv.textContent = '\u2718 ' + err.message;
+            });
+        }
+
         // ─── Init on load ─────────────────────────────────────────────────────────
         document.addEventListener('DOMContentLoaded', () => {
+            // Restore last selected protocol
+            const lastProto = localStorage.getItem('sim_lastProtocol');
+            if (lastProto) {
+                const btn = document.querySelector(`.protocol-tabs button[data-protocol="${lastProto}"]`);
+                if (btn) {
+                    document.querySelectorAll('.protocol-tabs button').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    selectedProtocol = lastProto;
+                    isFullSession = (selectedProtocol === 'full_session');
+                }
+            }
             loadSavedSettings();
             initCharts();
             toggleDiameterFields();
             toggleFullSessionFields();
+            updateDefaultsForProtocol();
         });
     </script>
 </body>
