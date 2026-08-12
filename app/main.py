@@ -919,6 +919,453 @@ async def reset_metrics():
     return {"status": "metrics reset"}
 
 
+# ─── Manual Step-by-Step Session Mode ─────────────────────────────────────────
+# Allows sending Initial/Update/Release one at a time for trace capture
+
+# Store active manual sessions keyed by session_id
+manual_sessions: Dict[str, dict] = {}
+
+
+class ManualSessionCreate(BaseModel):
+    """Config to create a manual step-by-step session."""
+    protocol: str  # chf, pcf, gy, ro, sy, scapv2
+    fqdn: str
+    port: int = 443
+    base_path: Optional[str] = None
+    secure: bool = True
+    verify_ssl: bool = False
+    subscriber: SubscriberConfig = SubscriberConfig()
+    rating_groups: List[int] = [1000]
+    # Diameter-specific
+    diameter_host: Optional[str] = None
+    diameter_port: int = 3868
+    origin_host: Optional[str] = None
+    origin_realm: Optional[str] = None
+    destination_host: Optional[str] = None
+    destination_realm: Optional[str] = None
+
+
+class ManualSessionUpdate(BaseModel):
+    """Config for sending an update in manual mode."""
+    session_id: str
+    used_units: Optional[List[dict]] = None  # Optional custom used units
+    total_volume: int = 1048576  # 1MB default per RG
+    uplink_volume: int = 314572  # ~30%
+    downlink_volume: int = 734003  # ~70%
+
+
+class ManualSessionRelease(BaseModel):
+    """Config for sending a release in manual mode."""
+    session_id: str
+    used_units: Optional[List[dict]] = None
+    total_volume: int = 524288  # 512KB default final
+    uplink_volume: int = 157286
+    downlink_volume: int = 367001
+
+
+@app.post("/api/manual/create")
+async def manual_create_session(config: ManualSessionCreate):
+    """Step 1: Send Initial/Create request. Returns full response with granted units/policy."""
+    try:
+        protocol_name = config.protocol.lower()
+
+        # Strip protocol prefix from FQDN
+        fqdn = config.fqdn.strip()
+        if fqdn.startswith("http://"):
+            fqdn = fqdn[7:]
+        elif fqdn.startswith("https://"):
+            fqdn = fqdn[8:]
+        fqdn = fqdn.rstrip("/")
+
+        # Resolve cert paths
+        cert_profile = CERT_DIR / "default"
+        cert_path = str(cert_profile / "client.crt") if (cert_profile / "client.crt").exists() else None
+        key_path = str(cert_profile / "client.key") if (cert_profile / "client.key").exists() else None
+
+        if protocol_name in ("chf", "scapv2"):
+            base_path = config.base_path or ("/nchf-convergedcharging/v2" if protocol_name == "chf" else "/scapv2/charging/v1")
+            handler = ChfSessionHandler(
+                fqdn=fqdn, port=config.port, base_path=base_path,
+                cert_path=cert_path, key_path=key_path, ca_path=None,
+                subscriber=config.subscriber.model_dump(),
+                secure=config.secure, verify_ssl=config.verify_ssl,
+            )
+        elif protocol_name == "pcf":
+            base_path = config.base_path or "/npcf-smpolicycontrol/v1"
+            handler = PcfSessionHandler(
+                fqdn=fqdn, port=config.port, base_path=base_path,
+                cert_path=cert_path, key_path=key_path, ca_path=None,
+                subscriber=config.subscriber.model_dump(),
+                secure=config.secure, verify_ssl=config.verify_ssl,
+            )
+        elif protocol_name in ("gy", "ro", "sy"):
+            diameter_host = config.diameter_host or fqdn
+            auth_app_id = 16777302 if protocol_name == "sy" else 4
+            diameter_client = DiameterCCClient(
+                host=diameter_host,
+                port=config.diameter_port or 3868,
+                origin_host=config.origin_host or "telecom-simulator.local",
+                origin_realm=config.origin_realm or "simulator.local",
+                destination_host=config.destination_host or diameter_host,
+                destination_realm=config.destination_realm or "operator.com",
+                auth_app_id=auth_app_id,
+                subscriber=config.subscriber.model_dump(),
+            )
+            connected = await diameter_client.connect()
+            if not connected:
+                return {"error": f"Failed to connect to Diameter peer at {diameter_host}:{config.diameter_port}"}
+            handler = DiameterSessionHandler(diameter_client)
+        else:
+            return {"error": f"Unknown protocol: {protocol_name}"}
+
+        # Send CREATE
+        start_time = time.perf_counter()
+        success, latency_ms, response_data = await handler.create_session(config.rating_groups)
+        session_ref = handler.get_session_ref()
+
+        # Generate session ID
+        session_id = f"manual_{protocol_name}_{int(time.time())}_{id(handler) % 10000}"
+
+        # Store the session
+        manual_sessions[session_id] = {
+            "handler": handler,
+            "protocol": protocol_name,
+            "session_ref": session_ref,
+            "sequence": 0,
+            "rating_groups": config.rating_groups,
+            "state": "created" if success else "failed",
+            "history": [],
+        }
+
+        # Record this step
+        step_record = {
+            "step": "CREATE",
+            "success": success,
+            "latency_ms": round(latency_ms, 2),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "response": response_data,
+            "session_ref": session_ref,
+        }
+        manual_sessions[session_id]["history"].append(step_record)
+
+        # Parse policy/grant info for display
+        policy_info = _extract_policy_info(protocol_name, response_data)
+
+        return {
+            "status": "created" if success else "failed",
+            "session_id": session_id,
+            "session_ref": session_ref,
+            "success": success,
+            "latency_ms": round(latency_ms, 2),
+            "response": response_data,
+            "policy_info": policy_info,
+            "next_step": "update",
+        }
+    except Exception as e:
+        import traceback
+        logger.error(f"manual_create error: {traceback.format_exc()}")
+        return {"error": str(e)}
+
+
+@app.post("/api/manual/update")
+async def manual_update_session(config: ManualSessionUpdate):
+    """Step 2+: Send Update request. Can be called multiple times."""
+    try:
+        session = manual_sessions.get(config.session_id)
+        if not session:
+            return {"error": f"Session not found: {config.session_id}"}
+        if session["state"] not in ("created", "updated"):
+            return {"error": f"Session in invalid state for update: {session['state']}"}
+
+        handler = session["handler"]
+        session["sequence"] += 1
+        sequence = session["sequence"]
+
+        # Build used units
+        if config.used_units:
+            used_units = config.used_units
+        else:
+            used_units = []
+            for rg in session["rating_groups"]:
+                used_units.append({
+                    "ratingGroup": rg,
+                    "usedUnitContainer": [{
+                        "totalVolume": config.total_volume,
+                        "uplinkVolume": config.uplink_volume,
+                        "downlinkVolume": config.downlink_volume,
+                        "localSequenceNumber": sequence,
+                    }],
+                    "requestedUnit": {},
+                })
+
+        # Send UPDATE
+        success, latency_ms, response_data = await handler.update_session(
+            sequence=sequence, used_units=used_units
+        )
+
+        session["state"] = "updated" if success else "update_failed"
+
+        # Record step
+        step_record = {
+            "step": f"UPDATE #{sequence}",
+            "success": success,
+            "latency_ms": round(latency_ms, 2),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "request_used_units": used_units,
+            "response": response_data,
+        }
+        session["history"].append(step_record)
+
+        # Parse policy/grant info
+        policy_info = _extract_policy_info(session["protocol"], response_data)
+
+        return {
+            "status": "updated" if success else "update_failed",
+            "session_id": config.session_id,
+            "sequence": sequence,
+            "success": success,
+            "latency_ms": round(latency_ms, 2),
+            "response": response_data,
+            "policy_info": policy_info,
+            "next_step": "update or release",
+        }
+    except Exception as e:
+        import traceback
+        logger.error(f"manual_update error: {traceback.format_exc()}")
+        return {"error": str(e)}
+
+
+@app.post("/api/manual/release")
+async def manual_release_session(config: ManualSessionRelease):
+    """Step 3: Send Release/Terminate request. Ends the session."""
+    try:
+        session = manual_sessions.get(config.session_id)
+        if not session:
+            return {"error": f"Session not found: {config.session_id}"}
+        if session["state"] in ("released", "failed"):
+            return {"error": f"Session already in state: {session['state']}"}
+
+        handler = session["handler"]
+        session["sequence"] += 1
+        sequence = session["sequence"]
+
+        # Build final used units
+        if config.used_units:
+            used_units = config.used_units
+        else:
+            used_units = []
+            for rg in session["rating_groups"]:
+                used_units.append({
+                    "ratingGroup": rg,
+                    "usedUnitContainer": [{
+                        "totalVolume": config.total_volume,
+                        "uplinkVolume": config.uplink_volume,
+                        "downlinkVolume": config.downlink_volume,
+                        "localSequenceNumber": sequence,
+                    }],
+                })
+
+        # Send RELEASE
+        success, latency_ms, response_data = await handler.release_session(
+            sequence=sequence, used_units=used_units
+        )
+
+        session["state"] = "released" if success else "release_failed"
+
+        # Record step
+        step_record = {
+            "step": "RELEASE",
+            "success": success,
+            "latency_ms": round(latency_ms, 2),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "request_used_units": used_units,
+            "response": response_data,
+        }
+        session["history"].append(step_record)
+
+        # Cleanup handler
+        if hasattr(handler, 'close'):
+            await handler.close()
+
+        return {
+            "status": "released" if success else "release_failed",
+            "session_id": config.session_id,
+            "sequence": sequence,
+            "success": success,
+            "latency_ms": round(latency_ms, 2),
+            "response": response_data,
+            "history": session["history"],
+            "next_step": "done",
+        }
+    except Exception as e:
+        import traceback
+        logger.error(f"manual_release error: {traceback.format_exc()}")
+        return {"error": str(e)}
+
+
+@app.get("/api/manual/sessions")
+async def list_manual_sessions():
+    """List all active manual sessions."""
+    sessions_list = []
+    for sid, session in manual_sessions.items():
+        sessions_list.append({
+            "session_id": sid,
+            "protocol": session["protocol"],
+            "session_ref": session["session_ref"],
+            "state": session["state"],
+            "sequence": session["sequence"],
+            "steps_completed": len(session["history"]),
+        })
+    return {"sessions": sessions_list}
+
+
+@app.get("/api/manual/session/{session_id}")
+async def get_manual_session(session_id: str):
+    """Get full history and state of a manual session."""
+    session = manual_sessions.get(session_id)
+    if not session:
+        return {"error": "Session not found"}
+    return {
+        "session_id": session_id,
+        "protocol": session["protocol"],
+        "session_ref": session["session_ref"],
+        "state": session["state"],
+        "sequence": session["sequence"],
+        "rating_groups": session["rating_groups"],
+        "history": session["history"],
+    }
+
+
+@app.delete("/api/manual/session/{session_id}")
+async def delete_manual_session(session_id: str):
+    """Delete/cleanup a manual session."""
+    session = manual_sessions.pop(session_id, None)
+    if not session:
+        return {"error": "Session not found"}
+    handler = session.get("handler")
+    if handler and hasattr(handler, 'close'):
+        try:
+            await handler.close()
+        except Exception:
+            pass
+    return {"status": "deleted"}
+
+
+def _extract_policy_info(protocol: str, response_data: Optional[dict]) -> dict:
+    """Extract and structure policy/charging info from response for display."""
+    if not response_data:
+        return {}
+
+    info = {}
+
+    if protocol == "pcf":
+        # PCF SM Policy response contains PCC rules, QoS, usage monitoring
+        if "pccRules" in response_data:
+            info["pcc_rules"] = []
+            pcc_rules = response_data["pccRules"]
+            if isinstance(pcc_rules, dict):
+                for rule_id, rule in pcc_rules.items():
+                    info["pcc_rules"].append({
+                        "rule_id": rule_id,
+                        "precedence": rule.get("precedence"),
+                        "flow_infos": rule.get("flowInfos", []),
+                        "ref_qos_data": rule.get("refQosData", []),
+                        "ref_chg_data": rule.get("refChgData", []),
+                    })
+
+        if "qosDecision" in response_data or "qosDecs" in response_data:
+            qos = response_data.get("qosDecision") or response_data.get("qosDecs", {})
+            info["qos_decisions"] = []
+            if isinstance(qos, dict):
+                for qos_id, qos_data in qos.items():
+                    info["qos_decisions"].append({
+                        "qos_id": qos_id,
+                        "5qi": qos_data.get("5qi"),
+                        "max_br_ul": qos_data.get("maxbrUl"),
+                        "max_br_dl": qos_data.get("maxbrDl"),
+                        "gbr_ul": qos_data.get("gbrUl"),
+                        "gbr_dl": qos_data.get("gbrDl"),
+                        "arp": qos_data.get("arp"),
+                        "priority_level": qos_data.get("priorityLevel"),
+                    })
+
+        if "sessRules" in response_data:
+            info["session_rules"] = []
+            sess_rules = response_data["sessRules"]
+            if isinstance(sess_rules, dict):
+                for rule_id, rule in sess_rules.items():
+                    info["session_rules"].append({
+                        "rule_id": rule_id,
+                        "sess_ambr": rule.get("authSessAmbr"),
+                        "default_qos": rule.get("authDefQos"),
+                    })
+
+        if "umDecs" in response_data:
+            info["usage_monitoring"] = []
+            um_decs = response_data["umDecs"]
+            if isinstance(um_decs, dict):
+                for um_id, um_data in um_decs.items():
+                    info["usage_monitoring"].append({
+                        "um_id": um_id,
+                        "volume_threshold": um_data.get("volumeThreshold"),
+                        "volume_threshold_uplink": um_data.get("volumeThresholdUplink"),
+                        "volume_threshold_downlink": um_data.get("volumeThresholdDownlink"),
+                        "time_threshold": um_data.get("timeThreshold"),
+                    })
+
+        if "chgDecs" in response_data:
+            info["charging_decisions"] = []
+            chg_decs = response_data["chgDecs"]
+            if isinstance(chg_decs, dict):
+                for chg_id, chg_data in chg_decs.items():
+                    info["charging_decisions"].append({
+                        "chg_id": chg_id,
+                        "online": chg_data.get("online"),
+                        "offline": chg_data.get("offline"),
+                        "rating_group": chg_data.get("ratingGroup"),
+                        "service_id": chg_data.get("serviceId"),
+                        "metering_method": chg_data.get("meteringMethod"),
+                    })
+
+        # Policy control request triggers
+        if "policyCtrlReqTriggers" in response_data:
+            info["triggers"] = response_data["policyCtrlReqTriggers"]
+
+    elif protocol in ("chf", "scapv2"):
+        # CHF response contains granted units, triggers, quotas
+        if "multipleUnitInformation" in response_data:
+            info["granted_units"] = []
+            for unit in response_data["multipleUnitInformation"]:
+                granted = unit.get("grantedUnit", {})
+                info["granted_units"].append({
+                    "rating_group": unit.get("ratingGroup"),
+                    "result_code": unit.get("resultCode"),
+                    "granted_total_volume": granted.get("totalVolume"),
+                    "granted_time": granted.get("time"),
+                    "volume_quota_threshold": unit.get("volumeQuotaThreshold"),
+                    "validity_time": unit.get("validityTime"),
+                    "quota_holding_time": unit.get("quotaHoldingTime"),
+                })
+
+        if "triggers" in response_data:
+            info["session_triggers"] = response_data["triggers"]
+
+    elif protocol in ("gy", "ro"):
+        # Diameter CCA - granted units
+        if "multipleUnitInformation" in response_data:
+            info["granted_units"] = []
+            for unit in response_data["multipleUnitInformation"]:
+                granted = unit.get("grantedUnit", {})
+                info["granted_units"].append({
+                    "rating_group": unit.get("ratingGroup"),
+                    "result_code": unit.get("resultCode"),
+                    "granted_total_volume": granted.get("totalVolume"),
+                    "granted_time": granted.get("time"),
+                })
+
+    return info
+
+
 @app.get("/api/logs", response_class=PlainTextResponse)
 async def get_logs(lines: int = 100):
     """View the last N lines of the application log."""

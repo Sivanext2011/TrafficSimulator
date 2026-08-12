@@ -387,6 +387,56 @@
             cursor: pointer;
             margin-right: 0.5rem;
         }
+        /* Manual Step-by-Step Mode */
+        .step-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+            padding: 0.3rem 0.6rem;
+            border-radius: 12px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            background: var(--bg-card);
+            color: var(--text-secondary);
+        }
+        .step-badge.completed { background: rgba(76,175,80,0.2); color: var(--success); }
+        .step-badge.active { background: rgba(233,69,96,0.2); color: var(--accent); }
+        .step-badge.pending { background: var(--bg-card); color: var(--text-secondary); }
+        .policy-section {
+            margin-bottom: 0.7rem;
+            padding: 0.6rem;
+            background: var(--bg-card);
+            border-radius: 6px;
+            border-left: 3px solid var(--accent);
+        }
+        .policy-section h4 {
+            font-size: 0.78rem;
+            color: var(--accent);
+            margin-bottom: 0.4rem;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+        .policy-item {
+            font-size: 0.75rem;
+            padding: 0.25rem 0;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+        .policy-item:last-child { border-bottom: none; }
+        .policy-key { color: var(--text-secondary); min-width: 100px; }
+        .policy-val { color: var(--text-primary); font-weight: 500; }
+        .policy-val.success { color: var(--success); }
+        .policy-val.error { color: var(--error); }
+        .latency-badge {
+            font-size: 0.72rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 10px;
+            background: rgba(76,175,80,0.15);
+            color: var(--success);
+            font-weight: 600;
+        }
     </style>
 </head>
 <body>
@@ -407,6 +457,7 @@
     <div class="sub-tabs" id="subTabs">
         <button data-tab="integration">Integration</button>
         <button class="active" data-tab="traffic">Traffic</button>
+        <button data-tab="manual" style="border-color:var(--warning);color:var(--warning);">Step-by-Step</button>
     </div>
 
 
@@ -615,6 +666,63 @@
                 </div>
             </div>
 
+            <!-- ═══ MANUAL STEP-BY-STEP TAB ═══ -->
+            <div class="tab-content" id="tabManual">
+                <div class="card">
+                    <h3>&#128203; Step-by-Step Session</h3>
+                    <p style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:0.8rem;">
+                        Send Initial → Update(s) → Release one at a time. Useful for trace capture and debugging.
+                    </p>
+                    <div class="form-group">
+                        <label>Rating Groups (comma-separated)</label>
+                        <input type="text" id="manualRatingGroups" placeholder="1000,2000" value="1000">
+                    </div>
+                    <div class="form-group">
+                        <label>Volume per Update (bytes)</label>
+                        <div class="form-row">
+                            <input type="number" id="manualTotalVolume" value="1048576" placeholder="Total">
+                            <input type="number" id="manualUplinkVolume" value="314572" placeholder="Uplink">
+                            <input type="number" id="manualDownlinkVolume" value="734003" placeholder="Downlink">
+                        </div>
+                    </div>
+                    <div class="btn-group" style="flex-wrap:wrap;">
+                        <button class="btn btn-start" id="btnManualCreate" onclick="manualCreate()" style="flex:1;">&#9654; Initial</button>
+                        <button class="btn" id="btnManualUpdate" onclick="manualUpdate()" disabled style="flex:1;background:var(--warning);color:#fff;opacity:0.5;">&#8635; Update</button>
+                        <button class="btn btn-stop" id="btnManualRelease" onclick="manualRelease()" disabled style="flex:1;opacity:0.5;">&#9632; Release</button>
+                    </div>
+                    <div style="display:flex;gap:0.4rem;margin-top:0.5rem;">
+                        <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;flex:1;" onclick="manualReset()">&#128260; New Session</button>
+                    </div>
+                </div>
+
+                <!-- Step Progress -->
+                <div class="card" id="manualProgressCard" style="display:none;">
+                    <h3>Session Progress</h3>
+                    <div id="manualStepIndicator" style="display:flex;gap:0.5rem;align-items:center;margin-bottom:0.5rem;">
+                    </div>
+                    <div style="font-size:0.78rem;color:var(--text-secondary);">
+                        <span>Session: </span><span id="manualSessionRef" style="color:var(--accent);font-weight:600;">—</span>
+                        <span style="margin-left:1rem;">State: </span><span id="manualSessionState" style="color:var(--success);font-weight:600;">—</span>
+                    </div>
+                </div>
+
+                <!-- Response / Policy Display -->
+                <div class="card" id="manualResponseCard" style="display:none;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+                        <h3 style="margin-bottom:0;">Response / Policy Info</h3>
+                        <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.2rem 0.5rem;" onclick="toggleRawJson()">{ } Raw JSON</button>
+                    </div>
+
+                    <!-- Policy Info Panel -->
+                    <div id="policyInfoPanel" style="margin-bottom:0.8rem;"></div>
+
+                    <!-- Raw JSON Panel (hidden by default) -->
+                    <div id="rawJsonPanel" style="display:none;max-height:300px;overflow-y:auto;background:var(--bg-primary);border-radius:6px;padding:0.7rem;">
+                        <pre id="rawJsonContent" style="font-size:0.75rem;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all;margin:0;"></pre>
+                    </div>
+                </div>
+            </div>
+
         </div>
 
 
@@ -758,6 +866,7 @@
                 const tab = e.target.dataset.tab;
                 document.getElementById('tabIntegration').classList.toggle('active', tab === 'integration');
                 document.getElementById('tabTraffic').classList.toggle('active', tab === 'traffic');
+                document.getElementById('tabManual').classList.toggle('active', tab === 'manual');
             }
         });
 
@@ -1445,6 +1554,348 @@
             responseChart.data.datasets[0].data = data;
             responseChart.data.datasets[0].backgroundColor = colors;
             responseChart.update();
+        }
+
+        // ─── Manual Step-by-Step Mode ─────────────────────────────────────────────
+        let manualSessionId = null;
+        let manualSteps = [];
+
+        function manualCreate() {
+            const ratingGroupsStr = document.getElementById('manualRatingGroups').value || '1000';
+            const ratingGroups = ratingGroupsStr.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+
+            const config = {
+                protocol: selectedProtocol === 'full_session' ? 'chf' : selectedProtocol,
+                fqdn: document.getElementById('fqdn').value || 'localhost',
+                port: parseInt(document.getElementById('port').value) || 443,
+                base_path: document.getElementById('basePath').value || null,
+                secure: document.getElementById('secure').checked,
+                verify_ssl: document.getElementById('verifySsl').checked,
+                subscriber: {
+                    msisdn: document.getElementById('msisdn').value || '886912345678',
+                    imsi: document.getElementById('imsi').value || '466010000000001',
+                    rating_group: ratingGroups[0] || 1000,
+                    slice_sst: parseInt(document.getElementById('sliceSST').value) || 1,
+                    slice_sd: document.getElementById('sliceSD').value || '000001',
+                    dnn: document.getElementById('dnn').value || 'internet',
+                    apn: document.getElementById('apn').value || 'internet',
+                    mcc: document.getElementById('mcc').value || '466',
+                    mnc: document.getElementById('mnc').value || '01'
+                },
+                rating_groups: ratingGroups,
+            };
+
+            // Add diameter fields
+            if (diameterProtocols.includes(selectedProtocol)) {
+                config.diameter_host = document.getElementById('diameterHost').value || null;
+                config.diameter_port = parseInt(document.getElementById('diameterPort').value) || 3868;
+                config.origin_host = document.getElementById('originHost').value || null;
+                config.origin_realm = document.getElementById('originRealm').value || null;
+                config.destination_host = document.getElementById('destinationHost').value || null;
+                config.destination_realm = document.getElementById('destinationRealm').value || null;
+            }
+
+            document.getElementById('btnManualCreate').disabled = true;
+            document.getElementById('btnManualCreate').textContent = 'Sending...';
+
+            fetch('/api/manual/create', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(config)
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    addLog('SYS', 'Manual', 'error', data.error);
+                    document.getElementById('btnManualCreate').disabled = false;
+                    document.getElementById('btnManualCreate').textContent = '\u25B6 Initial';
+                    return;
+                }
+                manualSessionId = data.session_id;
+                manualSteps = [{step: 'CREATE', success: data.success, latency: data.latency_ms}];
+
+                // Update buttons
+                document.getElementById('btnManualCreate').disabled = true;
+                document.getElementById('btnManualCreate').style.opacity = '0.5';
+                document.getElementById('btnManualCreate').textContent = '\u2714 Initial Sent';
+                document.getElementById('btnManualUpdate').disabled = false;
+                document.getElementById('btnManualUpdate').style.opacity = '1';
+                document.getElementById('btnManualRelease').disabled = false;
+                document.getElementById('btnManualRelease').style.opacity = '1';
+
+                // Show progress
+                updateManualProgress(data);
+                displayManualResponse(data);
+                addLog(selectedProtocol.toUpperCase(), 'CREATE', data.success ? 'ok' : 'error', `${data.latency_ms}ms — ref: ${data.session_ref || '—'}`);
+            })
+            .catch(err => {
+                addLog('SYS', 'Manual', 'error', err.message);
+                document.getElementById('btnManualCreate').disabled = false;
+                document.getElementById('btnManualCreate').textContent = '\u25B6 Initial';
+            });
+        }
+
+        function manualUpdate() {
+            if (!manualSessionId) return;
+
+            const config = {
+                session_id: manualSessionId,
+                total_volume: parseInt(document.getElementById('manualTotalVolume').value) || 1048576,
+                uplink_volume: parseInt(document.getElementById('manualUplinkVolume').value) || 314572,
+                downlink_volume: parseInt(document.getElementById('manualDownlinkVolume').value) || 734003,
+            };
+
+            document.getElementById('btnManualUpdate').textContent = 'Sending...';
+
+            fetch('/api/manual/update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(config)
+            })
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('btnManualUpdate').textContent = '\u21BB Update';
+                if (data.error) {
+                    addLog('SYS', 'Manual', 'error', data.error);
+                    return;
+                }
+                manualSteps.push({step: `UPDATE #${data.sequence}`, success: data.success, latency: data.latency_ms});
+                updateManualProgress(data);
+                displayManualResponse(data);
+                addLog(selectedProtocol.toUpperCase(), `UPDATE #${data.sequence}`, data.success ? 'ok' : 'error', `${data.latency_ms}ms`);
+            })
+            .catch(err => {
+                document.getElementById('btnManualUpdate').textContent = '\u21BB Update';
+                addLog('SYS', 'Manual', 'error', err.message);
+            });
+        }
+
+        function manualRelease() {
+            if (!manualSessionId) return;
+
+            const config = {
+                session_id: manualSessionId,
+                total_volume: parseInt(document.getElementById('manualTotalVolume').value) || 524288,
+                uplink_volume: parseInt(document.getElementById('manualUplinkVolume').value) || 157286,
+                downlink_volume: parseInt(document.getElementById('manualDownlinkVolume').value) || 367001,
+            };
+
+            document.getElementById('btnManualRelease').textContent = 'Sending...';
+            document.getElementById('btnManualUpdate').disabled = true;
+            document.getElementById('btnManualUpdate').style.opacity = '0.5';
+
+            fetch('/api/manual/release', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(config)
+            })
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('btnManualRelease').textContent = '\u2714 Released';
+                document.getElementById('btnManualRelease').disabled = true;
+                document.getElementById('btnManualRelease').style.opacity = '0.5';
+                if (data.error) {
+                    addLog('SYS', 'Manual', 'error', data.error);
+                    return;
+                }
+                manualSteps.push({step: 'RELEASE', success: data.success, latency: data.latency_ms});
+                updateManualProgress(data);
+                displayManualResponse(data);
+                addLog(selectedProtocol.toUpperCase(), 'RELEASE', data.success ? 'ok' : 'error', `${data.latency_ms}ms`);
+            })
+            .catch(err => {
+                document.getElementById('btnManualRelease').textContent = '\u25A0 Release';
+                addLog('SYS', 'Manual', 'error', err.message);
+            });
+        }
+
+        function manualReset() {
+            // Cleanup old session on server
+            if (manualSessionId) {
+                fetch(`/api/manual/session/${manualSessionId}`, { method: 'DELETE' }).catch(() => {});
+            }
+            manualSessionId = null;
+            manualSteps = [];
+
+            // Reset buttons
+            document.getElementById('btnManualCreate').disabled = false;
+            document.getElementById('btnManualCreate').style.opacity = '1';
+            document.getElementById('btnManualCreate').textContent = '\u25B6 Initial';
+            document.getElementById('btnManualUpdate').disabled = true;
+            document.getElementById('btnManualUpdate').style.opacity = '0.5';
+            document.getElementById('btnManualUpdate').textContent = '\u21BB Update';
+            document.getElementById('btnManualRelease').disabled = true;
+            document.getElementById('btnManualRelease').style.opacity = '0.5';
+            document.getElementById('btnManualRelease').textContent = '\u25A0 Release';
+
+            // Hide panels
+            document.getElementById('manualProgressCard').style.display = 'none';
+            document.getElementById('manualResponseCard').style.display = 'none';
+            document.getElementById('policyInfoPanel').innerHTML = '';
+            document.getElementById('rawJsonContent').textContent = '';
+        }
+
+        function updateManualProgress(data) {
+            document.getElementById('manualProgressCard').style.display = 'block';
+            document.getElementById('manualSessionRef').textContent = data.session_ref || data.session_id || '—';
+            document.getElementById('manualSessionState').textContent = data.status || '—';
+
+            // Build step badges
+            const container = document.getElementById('manualStepIndicator');
+            container.innerHTML = '';
+            manualSteps.forEach((s, i) => {
+                const badge = document.createElement('span');
+                badge.className = 'step-badge ' + (s.success ? 'completed' : 'active');
+                badge.innerHTML = `${s.success ? '\u2714' : '\u2718'} ${s.step} <span class="latency-badge">${s.latency.toFixed(0)}ms</span>`;
+                container.appendChild(badge);
+                if (i < manualSteps.length - 1) {
+                    const arrow = document.createElement('span');
+                    arrow.textContent = '\u2192';
+                    arrow.style.color = 'var(--text-secondary)';
+                    container.appendChild(arrow);
+                }
+            });
+        }
+
+        function displayManualResponse(data) {
+            document.getElementById('manualResponseCard').style.display = 'block';
+            const policyPanel = document.getElementById('policyInfoPanel');
+            const rawPanel = document.getElementById('rawJsonContent');
+
+            // Display raw JSON
+            rawPanel.textContent = JSON.stringify(data.response || {}, null, 2);
+
+            // Display structured policy info
+            const policy = data.policy_info || {};
+            let html = '';
+
+            // Granted Units (CHF/Diameter)
+            if (policy.granted_units && policy.granted_units.length > 0) {
+                html += '<div class="policy-section"><h4>\uD83D\uDCB0 Granted Units</h4>';
+                policy.granted_units.forEach(u => {
+                    const volMB = u.granted_total_volume ? (u.granted_total_volume / 1048576).toFixed(2) + ' MB' : '—';
+                    const resultClass = (u.result_code === 'SUCCESS' || !u.result_code) ? 'success' : 'error';
+                    html += `<div class="policy-item">
+                        <span class="policy-key">RG ${u.rating_group}</span>
+                        <span class="policy-val ${resultClass}">${u.result_code || 'SUCCESS'}</span>
+                        <span class="policy-val">Vol: ${volMB}</span>
+                        ${u.granted_time ? `<span class="policy-val">Time: ${u.granted_time}s</span>` : ''}
+                        ${u.validity_time ? `<span class="policy-val">Validity: ${u.validity_time}s</span>` : ''}
+                        ${u.volume_quota_threshold ? `<span class="policy-val">Threshold: ${(u.volume_quota_threshold/1024).toFixed(0)}KB</span>` : ''}
+                    </div>`;
+                });
+                html += '</div>';
+            }
+
+            // Session Triggers (CHF)
+            if (policy.session_triggers && policy.session_triggers.length > 0) {
+                html += '<div class="policy-section"><h4>\u26A1 Session Triggers</h4>';
+                policy.session_triggers.forEach(t => {
+                    html += `<div class="policy-item">
+                        <span class="policy-key">${t.triggerType || t}</span>
+                        ${t.timeLimit ? `<span class="policy-val">Time: ${t.timeLimit}s</span>` : ''}
+                        ${t.volumeLimit64 ? `<span class="policy-val">Vol: ${(t.volumeLimit64/1048576).toFixed(1)}MB</span>` : ''}
+                    </div>`;
+                });
+                html += '</div>';
+            }
+
+            // PCC Rules (PCF)
+            if (policy.pcc_rules && policy.pcc_rules.length > 0) {
+                html += '<div class="policy-section"><h4>\uD83D\uDCCB PCC Rules</h4>';
+                policy.pcc_rules.forEach(r => {
+                    html += `<div class="policy-item">
+                        <span class="policy-key">${r.rule_id}</span>
+                        <span class="policy-val">Prec: ${r.precedence || '—'}</span>
+                        ${r.ref_qos_data && r.ref_qos_data.length ? `<span class="policy-val">QoS: ${r.ref_qos_data.join(',')}</span>` : ''}
+                        ${r.ref_chg_data && r.ref_chg_data.length ? `<span class="policy-val">Chg: ${r.ref_chg_data.join(',')}</span>` : ''}
+                    </div>`;
+                    if (r.flow_infos && r.flow_infos.length) {
+                        r.flow_infos.forEach(f => {
+                            html += `<div class="policy-item" style="padding-left:1rem;font-size:0.7rem;">
+                                <span class="policy-key">Flow</span>
+                                <span class="policy-val">${f.flowDescription || JSON.stringify(f)}</span>
+                            </div>`;
+                        });
+                    }
+                });
+                html += '</div>';
+            }
+
+            // QoS Decisions (PCF)
+            if (policy.qos_decisions && policy.qos_decisions.length > 0) {
+                html += '<div class="policy-section"><h4>\uD83D\uDE80 QoS Decisions</h4>';
+                policy.qos_decisions.forEach(q => {
+                    html += `<div class="policy-item">
+                        <span class="policy-key">${q.qos_id}</span>
+                        ${q['5qi'] ? `<span class="policy-val">5QI: ${q['5qi']}</span>` : ''}
+                        ${q.max_br_dl ? `<span class="policy-val">MaxDL: ${q.max_br_dl}</span>` : ''}
+                        ${q.max_br_ul ? `<span class="policy-val">MaxUL: ${q.max_br_ul}</span>` : ''}
+                        ${q.gbr_dl ? `<span class="policy-val">GBR-DL: ${q.gbr_dl}</span>` : ''}
+                        ${q.gbr_ul ? `<span class="policy-val">GBR-UL: ${q.gbr_ul}</span>` : ''}
+                    </div>`;
+                });
+                html += '</div>';
+            }
+
+            // Session Rules (PCF)
+            if (policy.session_rules && policy.session_rules.length > 0) {
+                html += '<div class="policy-section"><h4>\uD83D\uDCC4 Session Rules</h4>';
+                policy.session_rules.forEach(s => {
+                    html += `<div class="policy-item">
+                        <span class="policy-key">${s.rule_id}</span>
+                        ${s.sess_ambr ? `<span class="policy-val">AMBR: UL=${s.sess_ambr.uplink || '—'} DL=${s.sess_ambr.downlink || '—'}</span>` : ''}
+                        ${s.default_qos ? `<span class="policy-val">DefQoS: 5QI=${s.default_qos['5qi'] || '—'}</span>` : ''}
+                    </div>`;
+                });
+                html += '</div>';
+            }
+
+            // Usage Monitoring (PCF)
+            if (policy.usage_monitoring && policy.usage_monitoring.length > 0) {
+                html += '<div class="policy-section"><h4>\uD83D\uDCCA Usage Monitoring</h4>';
+                policy.usage_monitoring.forEach(u => {
+                    html += `<div class="policy-item">
+                        <span class="policy-key">${u.um_id}</span>
+                        ${u.volume_threshold ? `<span class="policy-val">Vol: ${(u.volume_threshold/1048576).toFixed(1)}MB</span>` : ''}
+                        ${u.time_threshold ? `<span class="policy-val">Time: ${u.time_threshold}s</span>` : ''}
+                    </div>`;
+                });
+                html += '</div>';
+            }
+
+            // Charging Decisions (PCF)
+            if (policy.charging_decisions && policy.charging_decisions.length > 0) {
+                html += '<div class="policy-section"><h4>\uD83D\uDCB3 Charging Decisions</h4>';
+                policy.charging_decisions.forEach(c => {
+                    html += `<div class="policy-item">
+                        <span class="policy-key">${c.chg_id}</span>
+                        <span class="policy-val">RG: ${c.rating_group || '—'}</span>
+                        <span class="policy-val">Online: ${c.online ? '\u2714' : '\u2718'}</span>
+                        <span class="policy-val">Offline: ${c.offline ? '\u2714' : '\u2718'}</span>
+                        ${c.metering_method ? `<span class="policy-val">${c.metering_method}</span>` : ''}
+                    </div>`;
+                });
+                html += '</div>';
+            }
+
+            // Triggers (PCF)
+            if (policy.triggers && policy.triggers.length > 0) {
+                html += '<div class="policy-section"><h4>\u26A1 Policy Triggers</h4>';
+                html += `<div class="policy-item"><span class="policy-val">${policy.triggers.join(', ')}</span></div>`;
+                html += '</div>';
+            }
+
+            if (!html) {
+                html = '<div style="color:var(--text-secondary);font-size:0.8rem;text-align:center;padding:0.5rem;">No structured policy info available. Check Raw JSON.</div>';
+            }
+
+            policyPanel.innerHTML = html;
+        }
+
+        function toggleRawJson() {
+            const panel = document.getElementById('rawJsonPanel');
+            panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
         }
 
         // ─── Log Control Functions ────────────────────────────────────────────────
