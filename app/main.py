@@ -43,13 +43,36 @@ from app.protocols.diameter_ro import DiameterRoProtocol
 from app.protocols.scapv2 import ScapV2Protocol
 
 import httpx
+import ssl
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Telecom Traffic Simulator", version="2.0.0")
 
-CERT_DIR = Path("/app/certs")
+CERT_DIR = Path("/app/certs") if os.path.exists("/app/certs") else Path(__file__).parent.parent / "certs"
 CERT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ─── SOCKS5 Proxy Configuration ──────────────────────────────────────────────
+# Set via environment variables or defaults for local dev with SSH tunnel
+SOCKS5_PROXY = os.environ.get("SOCKS5_PROXY", "socks5://127.0.0.1:1080")
+SOCKS5_ENABLED = os.environ.get("SOCKS5_ENABLED", "true").lower() in ("true", "1", "yes")
+
+def _build_socks5_transport(cert_path: str = None, key_path: str = None):
+    """Build an AsyncProxyTransport with optional mTLS through SOCKS5."""
+    try:
+        import httpx_socks
+    except ImportError:
+        logger.warning("httpx_socks not installed — SOCKS5 proxy disabled. Run: pip install httpx-socks")
+        return None
+
+    if cert_path and key_path and Path(cert_path).exists() and Path(key_path).exists():
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.load_cert_chain(cert_path, key_path)
+        return httpx_socks.AsyncProxyTransport.from_url(SOCKS5_PROXY, verify=ctx)
+    else:
+        return httpx_socks.AsyncProxyTransport.from_url(SOCKS5_PROXY, verify=False)
 
 # Global state
 consumption_engine = ConsumptionEngine()
@@ -102,21 +125,28 @@ class ChfSessionHandler:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
+            timeout = httpx.Timeout(30.0, connect=10.0)
+            if SOCKS5_ENABLED and SOCKS5_PROXY:
+                transport = _build_socks5_transport(self.cert_path, self.key_path)
+                if transport:
+                    self._client = httpx.AsyncClient(timeout=timeout, transport=transport)
+                    return self._client
+            # Fallback: direct connection (no proxy)
             if not self.secure:
                 self._client = httpx.AsyncClient(
                     verify=False,
-                    timeout=httpx.Timeout(30.0, connect=10.0),
+                    timeout=timeout,
                 )
             elif self.cert_path and self.key_path:
                 self._client = httpx.AsyncClient(
                     verify=False,
                     cert=(self.cert_path, self.key_path),
-                    timeout=httpx.Timeout(30.0, connect=10.0),
+                    timeout=timeout,
                 )
             else:
                 self._client = httpx.AsyncClient(
                     verify=False,
-                    timeout=httpx.Timeout(30.0, connect=10.0),
+                    timeout=timeout,
                 )
         return self._client
 
@@ -443,6 +473,12 @@ class PcfSessionHandler:
 
     async def _get_client(self):
         if self._client is None or self._client.is_closed:
+            if SOCKS5_ENABLED and SOCKS5_PROXY:
+                transport = _build_socks5_transport(self.cert_path, self.key_path)
+                if transport:
+                    self._client = httpx.AsyncClient(timeout=30.0, transport=transport)
+                    return self._client
+            # Fallback: direct connection (no proxy)
             kwargs = {"verify": False, "timeout": 30.0}
             if self.secure and self.cert_path and self.key_path:
                 kwargs["cert"] = (self.cert_path, self.key_path)
