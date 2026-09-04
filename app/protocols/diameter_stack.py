@@ -67,6 +67,9 @@ class AVPCode(IntEnum):
     CC_INPUT_OCTETS = 412
     CC_OUTPUT_OCTETS = 414
     CC_TIME = 420
+    VALIDITY_TIME = 448
+    FINAL_UNIT_INDICATION = 430
+    FINAL_UNIT_ACTION = 449
     SERVICE_INFORMATION = 873  # 3GPP
     PS_INFORMATION = 874  # 3GPP
     SERVICE_CONTEXT_ID = 461  # Selects the charging service context (e.g. Gy: 32251@3gpp.org)
@@ -579,6 +582,9 @@ class DiameterCCClient:
         self.service_context_id = "32251@3GPP.org" if auth_app_id == 4 else "32260@3gpp.org"
         self._session_id: Optional[str] = None
         self._cc_request_number: int = 0
+        # Per-rating-group quota tracking: rg -> {granted_total, used_total,
+        # validity_time, final, final_unit_action, last_result_code}
+        self._quota: Dict[int, dict] = {}
 
         self._transport = DiameterTransport(
             host=host,
@@ -704,6 +710,7 @@ class DiameterCCClient:
         if request_type == CCRequestType.INITIAL:
             self._session_id = f"{self._transport.origin_host};{int(time.time())};{uuid.uuid4().hex[:8]}"
             self._cc_request_number = 0
+            self._quota = {}  # fresh quota tracking per session
         else:
             self._cc_request_number += 1
 
@@ -768,19 +775,125 @@ class DiameterCCClient:
                 result_code = struct.unpack("!I", avp["data"][:4])[0] if len(avp["data"]) >= 4 else 0
                 break
 
-        # Parse per-MSCC Result-Codes. A command-level 2001 can still carry a
-        # per-rating-group failure (e.g. 5031 RATING_FAILED with no granted
-        # units). Treat that as NOT successful so the UI/metrics reflect that
-        # no units were actually granted/deducted.
-        mscc_codes = []
-        for avp in answer.get("avps", []):
-            if avp["code"] == AVPCode.MULTIPLE_SERVICES_CC:
-                for inner in decode_avps(avp["data"]):
-                    if inner["code"] == AVPCode.RESULT_CODE and len(inner["data"]) >= 4:
-                        mscc_codes.append(struct.unpack("!I", inner["data"][:4])[0])
+        # Parse each MSCC into structured grant details (result code, granted
+        # volume/time, validity-time, final-unit-indication/action).
+        mscc_list = self._parse_answer_mscc(answer.get("avps", []))
+        mscc_codes = [m["result_code"] for m in mscc_list if m["result_code"] is not None]
+
+        # Update per-rating-group quota tracking and detect final/exhaustion.
+        for m in mscc_list:
+            self._update_quota(m, request_type)
 
         top_ok = result_code in (2001, 0)
         mscc_ok = all(c == 2001 for c in mscc_codes) if mscc_codes else True
         success = top_ok and mscc_ok
-        logger.debug(f"CCA result_code={result_code} mscc_codes={mscc_codes} success={success}")
-        return success, latency_ms, {"result_code": result_code, "mscc_result_codes": mscc_codes, "answer": answer}
+        logger.debug(f"CCA result_code={result_code} mscc={mscc_list} success={success}")
+        return success, latency_ms, {
+            "result_code": result_code,
+            "mscc_result_codes": mscc_codes,
+            "mscc": mscc_list,
+            "quota": self.get_quota_state(),
+            "final": self.is_final(),
+            "answer": answer,
+        }
+
+    # ── Grant / quota / Final-Unit-Indication handling ──────────────────────
+
+    def _parse_answer_mscc(self, top_avps: List[dict]) -> List[dict]:
+        """Parse each Multiple-Services-Credit-Control in the CCA into a dict:
+        {rating_group, result_code, granted_total_octets, granted_time,
+         validity_time, final, final_unit_action}."""
+        out = []
+        for avp in top_avps:
+            if avp.get("code") != AVPCode.MULTIPLE_SERVICES_CC:
+                continue
+            rg = rc = gtot = gtime = validity = fua = None
+            final = False
+            for iavp in decode_avps(avp["data"]):
+                c = iavp["code"]; d = iavp["data"]
+                if c == AVPCode.RATING_GROUP and len(d) >= 4:
+                    rg = struct.unpack("!I", d[:4])[0]
+                elif c == AVPCode.RESULT_CODE and len(d) >= 4:
+                    rc = struct.unpack("!I", d[:4])[0]
+                elif c == AVPCode.VALIDITY_TIME and len(d) >= 4:
+                    validity = struct.unpack("!I", d[:4])[0]
+                elif c == AVPCode.GRANTED_SERVICE_UNIT:
+                    for g in decode_avps(d):
+                        if g["code"] == AVPCode.CC_TOTAL_OCTETS and len(g["data"]) >= 8:
+                            gtot = struct.unpack("!Q", g["data"][:8])[0]
+                        elif g["code"] == AVPCode.CC_TIME and len(g["data"]) >= 4:
+                            gtime = struct.unpack("!I", g["data"][:4])[0]
+                elif c == AVPCode.FINAL_UNIT_INDICATION:
+                    final = True
+                    for f in decode_avps(d):
+                        if f["code"] == AVPCode.FINAL_UNIT_ACTION and len(f["data"]) >= 4:
+                            fua = struct.unpack("!I", f["data"][:4])[0]
+            out.append({
+                "rating_group": rg,
+                "result_code": rc,
+                "granted_total_octets": gtot,
+                "granted_time": gtime,
+                "validity_time": validity,
+                "final": final,
+                "final_unit_action": fua,
+            })
+        return out
+
+    def _update_quota(self, mscc: dict, request_type: "CCRequestType") -> None:
+        """Update per-rating-group quota tracking from a parsed MSCC."""
+        rg = mscc.get("rating_group")
+        if rg is None:
+            return
+        q = self._quota.setdefault(rg, {
+            "granted_total": 0, "used_total": 0, "validity_time": None,
+            "final": False, "final_unit_action": None, "last_result_code": None,
+            "exhausted": False,
+        })
+        q["last_result_code"] = mscc.get("result_code")
+        if mscc.get("validity_time") is not None:
+            q["validity_time"] = mscc["validity_time"]
+        if mscc.get("final"):
+            q["final"] = True
+            q["final_unit_action"] = mscc.get("final_unit_action")
+        gt = mscc.get("granted_total_octets")
+        if gt is not None:
+            # A new grant of 0 octets on a final indication means exhausted.
+            q["granted_total"] += gt
+            if gt == 0 and q["final"]:
+                q["exhausted"] = True
+
+    def record_usage(self, rating_group: int, used_octets: int) -> None:
+        """Record consumed octets for a rating group (drives CCR-U used units)."""
+        q = self._quota.setdefault(rating_group, {
+            "granted_total": 0, "used_total": 0, "validity_time": None,
+            "final": False, "final_unit_action": None, "last_result_code": None,
+            "exhausted": False,
+        })
+        q["used_total"] += max(0, int(used_octets))
+        if q["granted_total"] and q["used_total"] >= q["granted_total"] and q["final"]:
+            q["exhausted"] = True
+
+    def remaining_quota(self, rating_group: int) -> Optional[int]:
+        """Remaining granted octets for a rating group (None if never granted)."""
+        q = self._quota.get(rating_group)
+        if not q or not q["granted_total"]:
+            return None
+        return max(0, q["granted_total"] - q["used_total"])
+
+    def is_final(self, rating_group: Optional[int] = None) -> bool:
+        """True if a Final-Unit-Indication was received (for a specific RG or any)."""
+        if rating_group is not None:
+            q = self._quota.get(rating_group)
+            return bool(q and q["final"])
+        return any(q.get("final") for q in self._quota.values())
+
+    def is_exhausted(self, rating_group: Optional[int] = None) -> bool:
+        """True if quota is exhausted (final grant consumed / zero final grant)."""
+        if rating_group is not None:
+            q = self._quota.get(rating_group)
+            return bool(q and q["exhausted"])
+        return any(q.get("exhausted") for q in self._quota.values())
+
+    def get_quota_state(self) -> dict:
+        """Snapshot of per-rating-group quota state for reporting/UI."""
+        return {rg: dict(q) for rg, q in self._quota.items()}
