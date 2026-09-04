@@ -37,7 +37,31 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
 console_handler.setLevel(logging.INFO)
 
-logging.basicConfig(level=logging.DEBUG, handlers=[file_handler, console_handler])
+
+class RingLogHandler(logging.Handler):
+    """Keeps the last N log records in memory for the /api/logs/events endpoint."""
+    def __init__(self, capacity: int = 500):
+        super().__init__()
+        from collections import deque
+        self.records = deque(maxlen=capacity)
+
+    def emit(self, record):
+        try:
+            self.records.append({
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(record.created)),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+            })
+        except Exception:
+            pass
+
+
+ring_handler = RingLogHandler(500)
+ring_handler.setLevel(logging.DEBUG)
+ring_handler.setFormatter(logging.Formatter("%(message)s"))
+
+logging.basicConfig(level=logging.DEBUG, handlers=[file_handler, console_handler, ring_handler])
 
 from app.protocols.diameter_ro import DiameterRoProtocol
 from app.protocols.scapv2 import ScapV2Protocol
@@ -815,6 +839,54 @@ async def save_settings(request: Request):
     return {"status": "saved"}
 
 
+# ── Named integration profiles (multi-environment) ───────────────────────────
+PROFILES_DIR = SETTINGS_DIR / "profiles"
+
+
+def _safe_profile_name(name: str) -> str:
+    keep = "-_.abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    return "".join(c for c in (name or "") if c in keep)[:64]
+
+
+@app.get("/api/profiles")
+async def list_profiles():
+    """List saved integration profile names."""
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    names = sorted(p.stem for p in PROFILES_DIR.glob("*.json"))
+    return {"profiles": names}
+
+
+@app.get("/api/profiles/{name}")
+async def get_profile(name: str):
+    """Get a named profile's settings blob."""
+    f = PROFILES_DIR / f"{_safe_profile_name(name)}.json"
+    if not f.exists():
+        return {"error": f"profile not found: {name}"}
+    return json.loads(f.read_text(encoding="utf-8"))
+
+
+@app.post("/api/profiles/{name}")
+async def save_profile(name: str, request: Request):
+    """Save/overwrite a named profile (settings JSON in the body)."""
+    safe = _safe_profile_name(name)
+    if not safe:
+        return {"error": "invalid profile name"}
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    (PROFILES_DIR / f"{safe}.json").write_text(
+        json.dumps(await request.json(), indent=2), encoding="utf-8")
+    return {"status": "saved", "profile": safe}
+
+
+@app.delete("/api/profiles/{name}")
+async def delete_profile(name: str):
+    """Delete a named profile."""
+    f = PROFILES_DIR / f"{_safe_profile_name(name)}.json"
+    if f.exists():
+        f.unlink()
+        return {"status": "deleted", "profile": name}
+    return {"error": f"profile not found: {name}"}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html_path = Path(__file__).parent / "static" / "index.html"
@@ -994,6 +1066,36 @@ async def diameter_status():
     return DIAG.get_status()
 
 
+@app.get("/api/logs/events")
+async def log_events(limit: int = 100, level: Optional[str] = None):
+    """Return the last N structured log events (optionally filtered by level)."""
+    items = list(ring_handler.records)
+    if level:
+        lv = level.upper()
+        items = [r for r in items if r["level"] == lv]
+    return {"events": items[-limit:]}
+
+
+@app.get("/api/logs/level")
+async def get_log_level():
+    """Get the current effective root log level."""
+    return {"level": logging.getLevelName(logging.getLogger().getEffectiveLevel())}
+
+
+@app.post("/api/logs/level")
+async def set_log_level(request: Request):
+    """Set the root/console log level at runtime (DEBUG/INFO/WARNING/ERROR)."""
+    data = await request.json()
+    level_name = str(data.get("level", "INFO")).upper()
+    level = getattr(logging, level_name, None)
+    if not isinstance(level, int):
+        return {"error": f"invalid level: {level_name}"}
+    logging.getLogger().setLevel(level)
+    console_handler.setLevel(level)
+    logger.info(f"Log level set to {level_name}")
+    return {"status": "ok", "level": level_name}
+
+
 @app.post("/api/traffic/speed")
 async def update_speed(update: SpeedUpdate):
     """Update the simulated download speed in real time (slider changes)."""
@@ -1011,7 +1113,20 @@ async def update_tps(cmd: ControlCommand):
 
 @app.get("/api/metrics")
 async def get_metrics():
-    return consumption_engine.get_metrics()
+    m = consumption_engine.get_metrics()
+    # Latency percentiles from the engine's recent samples
+    lat = sorted(getattr(consumption_engine, "_latencies", []) or [])
+    def _pct(p):
+        if not lat:
+            return 0.0
+        i = min(len(lat) - 1, int(round((p / 100.0) * (len(lat) - 1))))
+        return round(lat[i], 2)
+    m["latency_p50_ms"] = _pct(50)
+    m["latency_p95_ms"] = _pct(95)
+    m["latency_p99_ms"] = _pct(99)
+    # Diameter result-code breakdown (from diagnostics)
+    m["result_codes"] = DIAG.get_status().get("result_codes", {})
+    return m
 
 
 @app.post("/api/metrics/reset")
