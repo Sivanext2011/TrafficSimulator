@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.consumption_engine import ConsumptionEngine
-from app.protocols.diameter_stack import DiameterCCClient, CCRequestType, decode_avps
+from app.protocols.diameter_stack import DiameterCCClient, CCRequestType, decode_avps, DIAG
 from app.protocols.chf import ChfProtocol
 from app.protocols.pcf import PcfProtocol
 from app.protocols.diameter_gy import DiameterGyProtocol
@@ -973,6 +973,18 @@ async def start_traffic(config: TrafficConfig):
 async def stop_traffic():
     await consumption_engine.stop()
     return {"status": "stopped"}
+
+
+@app.get("/api/diameter/messages")
+async def diameter_messages(limit: int = 50, peer: Optional[str] = None):
+    """Recent Diameter messages (TX/RX) with decoded AVP summary + hex."""
+    return {"messages": DIAG.get_messages(limit=limit, peer=peer)}
+
+
+@app.get("/api/diameter/status")
+async def diameter_status():
+    """Per-peer Diameter connection/health status and result-code breakdown."""
+    return DIAG.get_status()
 
 
 @app.post("/api/traffic/speed")

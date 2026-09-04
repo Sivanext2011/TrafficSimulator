@@ -17,8 +17,78 @@ import uuid
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Dict, List, Optional, Tuple
+from collections import deque, Counter
 
 logger = logging.getLogger(__name__)
+
+
+class DiameterDiagnostics:
+    """Process-wide diagnostics for Diameter: a ring buffer of recent messages
+    (decoded + hex) and per-peer health/connection status. Consumed by the
+    /api/diameter/* endpoints so operators can see wire activity and state
+    without reading pod logs."""
+
+    def __init__(self, capacity: int = 200):
+        self.messages: deque = deque(maxlen=capacity)
+        self.health: Dict[str, dict] = {}   # peer_key -> status dict
+        self.result_codes: Counter = Counter()
+
+    # ---- capture ----
+    def record_message(self, direction: str, peer: str, header: dict,
+                       avps_decoded=None, raw: bytes = b""):
+        entry = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            "direction": direction,               # "TX" or "RX"
+            "peer": peer,
+            "command_code": header.get("command_code"),
+            "is_request": header.get("is_request"),
+            "application_id": header.get("application_id"),
+            "hop_by_hop": header.get("hop_by_hop"),
+            "length": header.get("length"),
+            "avps": avps_decoded or [],
+            "hex": raw.hex() if raw else "",
+        }
+        self.messages.append(entry)
+
+    def get_messages(self, limit: int = 50, peer: str = None):
+        items = list(self.messages)
+        if peer:
+            items = [m for m in items if m["peer"] == peer]
+        return items[-limit:]
+
+    # ---- health ----
+    def _peer(self, key: str) -> dict:
+        return self.health.setdefault(key, {
+            "peer": key, "state": "idle", "cer_result": None,
+            "peer_origin_host": None, "peer_origin_realm": None,
+            "last_error": None, "reconnect_count": 0,
+            "dwr_received": 0, "dwa_sent": 0,
+            "last_tx": None, "last_rx": None, "connected": False,
+        })
+
+    def set_state(self, key, state, **kw):
+        p = self._peer(key); p["state"] = state
+        for k, v in kw.items():
+            p[k] = v
+
+    def note_reconnect(self, key):
+        self._peer(key)["reconnect_count"] += 1
+
+    def note_error(self, key, err):
+        self._peer(key)["last_error"] = str(err)
+
+    def note_result_code(self, code):
+        if code is not None:
+            self.result_codes[str(code)] += 1
+
+    def get_status(self):
+        return {"peers": list(self.health.values()),
+                "result_codes": dict(self.result_codes)}
+
+
+# Process-wide singleton
+DIAG = DiameterDiagnostics()
+
 
 
 # ─── Diameter Constants ───────────────────────────────────────────────────────
@@ -312,6 +382,10 @@ class DiameterTransport:
     def connected(self) -> bool:
         return self._connected
 
+    @property
+    def peer_key(self) -> str:
+        return f"{self.host}:{self.port}#{self.origin_host}"
+
     def _next_hop_by_hop(self) -> int:
         self._hop_by_hop += 1
         return self._hop_by_hop
@@ -325,6 +399,7 @@ class DiameterTransport:
         # Drop any stale/half-open association before opening a fresh one.
         if self._writer is not None or self._recv_task is not None:
             await self.disconnect()
+        DIAG.set_state(self.peer_key, "connecting", connected=False)
         try:
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port),
@@ -336,13 +411,17 @@ class DiameterTransport:
             # Send CER
             success = await self._send_cer()
             if not success:
+                DIAG.set_state(self.peer_key, "cer_failed", cer_result="failed", connected=False)
                 await self.disconnect()
                 return False
 
+            DIAG.set_state(self.peer_key, "connected", cer_result="ok", connected=True)
             return True
 
         except (OSError, asyncio.TimeoutError) as e:
             logger.error(f"Diameter connect failed: {e}")
+            DIAG.note_error(self.peer_key, e)
+            DIAG.set_state(self.peer_key, "connect_failed", connected=False)
             await self.disconnect()
             return False
 
@@ -410,6 +489,13 @@ class DiameterTransport:
         try:
             self._writer.write(msg)
             await self._writer.drain()
+            DIAG.record_message("TX", self.peer_key,
+                                {"command_code": command_code, "is_request": True,
+                                 "application_id": app_id, "hop_by_hop": hbh, "length": len(msg)},
+                                avps_decoded=[{"code": a["code"], "vendor_id": a.get("vendor_id", 0),
+                                               "len": len(a.get("data", b""))} for a in decode_avps(b"".join(avps))],
+                                raw=msg)
+            DIAG.set_state(self.peer_key, "connected", last_tx=time.strftime("%H:%M:%S", time.gmtime()))
 
             # Wait for answer (timeout 30s)
             answer = await asyncio.wait_for(future, timeout=30.0)
@@ -465,9 +551,16 @@ class DiameterTransport:
         # Log the peer's advertised identity so we know the correct routing target.
         try:
             _peer = []
+            _oh = _orl = None
             for avp in answer.get("avps", []):
-                if avp["code"] in (AVPCode.ORIGIN_HOST, AVPCode.ORIGIN_REALM):
-                    _peer.append(f"{AVPCode(avp['code']).name}={avp['data'].decode('utf-8','replace')}")
+                if avp["code"] == AVPCode.ORIGIN_HOST:
+                    _oh = avp["data"].decode("utf-8", "replace")
+                    _peer.append(f"ORIGIN_HOST={_oh}")
+                elif avp["code"] == AVPCode.ORIGIN_REALM:
+                    _orl = avp["data"].decode("utf-8", "replace")
+                    _peer.append(f"ORIGIN_REALM={_orl}")
+            DIAG.set_state(self.peer_key, "connected",
+                           peer_origin_host=_oh, peer_origin_realm=_orl)
             logger.debug(f"CEA peer identity: {', '.join(_peer)}")
         except Exception:
             pass
@@ -491,6 +584,18 @@ class DiameterTransport:
                 # Parse AVPs
                 avps = decode_avps(body_data)
                 header["avps"] = avps
+
+                DIAG.record_message("RX", self.peer_key, header,
+                                    avps_decoded=[{"code": a["code"], "vendor_id": a.get("vendor_id", 0),
+                                                   "len": len(a.get("data", b""))} for a in avps],
+                                    raw=header_data + body_data)
+                DIAG.set_state(self.peer_key, "connected", last_rx=time.strftime("%H:%M:%S", time.gmtime()))
+                # Track result code on answers
+                if not header["is_request"]:
+                    for a in avps:
+                        if a["code"] == AVPCode.RESULT_CODE and len(a["data"]) >= 4:
+                            DIAG.note_result_code(struct.unpack("!I", a["data"][:4])[0])
+                            break
 
                 logger.debug(
                     f"RX cmd={header['command_code']} is_request={header['is_request']} "
@@ -521,6 +626,9 @@ class DiameterTransport:
             # dead: mark disconnected AND unblock in-flight requests so callers
             # fail fast instead of waiting for the 30s timeout.
             self._connected = False
+            if exc:
+                DIAG.note_error(self.peer_key, exc)
+            DIAG.set_state(self.peer_key, "disconnected", connected=False)
             self._fail_pending(exc or ConnectionError("Diameter receive loop ended"))
 
     async def _handle_request(self, msg: dict):
@@ -528,6 +636,7 @@ class DiameterTransport:
         cmd = msg["command_code"]
         logger.debug(f"Incoming request cmd={cmd} hbh={msg['hop_by_hop']}")
         if cmd == CommandCode.DWR:
+            DIAG._peer(self.peer_key)["dwr_received"] += 1
             # DWA is command 280 (same as DWR) with the R-bit cleared.
             avps = [
                 encode_uint32_avp(AVPCode.RESULT_CODE, 2001),  # DIAMETER_SUCCESS
@@ -542,6 +651,7 @@ class DiameterTransport:
                 try:
                     self._writer.write(answer)
                     await self._writer.drain()
+                    DIAG._peer(self.peer_key)["dwa_sent"] += 1
                 except (OSError, ConnectionError) as e:
                     # Failing to answer the watchdog means the peer will drop
                     # us; surface it and let the association be torn down.
