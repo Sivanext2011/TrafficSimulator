@@ -528,6 +528,16 @@
                             <input type="text" id="destinationRealm" placeholder="operator.com">
                         </div>
                     </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Service-Context-Id</label>
+                            <input type="text" id="serviceContextId" placeholder="32251@3GPP.org">
+                        </div>
+                        <div class="form-group">
+                            <label>Auth-Application-Id</label>
+                            <input type="number" id="authApplicationId" value="4">
+                        </div>
+                    </div>
                 </div>
 
                 <!-- Full Session (eN28) fields -->
@@ -578,7 +588,7 @@
                 </div>
 
                 <div class="card">
-                    <button class="btn btn-save" onclick="saveSettings()">&#128190; Save Settings</button>
+                    <button class="btn btn-save" onclick="saveSettings()">&#128190; Save / Update Integration</button>
                     <div style="display:flex; gap:0.5rem; margin-top:0.5rem;">
                         <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.75rem;padding:0.4rem 0.8rem;flex:1;" onclick="exportSettings()">&#11015; Export Config</button>
                         <label class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.75rem;padding:0.4rem 0.8rem;flex:1;text-align:center;cursor:pointer;">&#11014; Import Config
@@ -848,7 +858,7 @@
             'fqdn', 'port', 'basePath', 'secure', 'verifySsl',
             // Diameter fields
             'diameterHost', 'diameterPort', 'originHost', 'originRealm',
-            'destinationHost', 'destinationRealm',
+            'destinationHost', 'destinationRealm', 'serviceContextId', 'authApplicationId',
             // eN28 fields
             'en28Fqdn', 'en28Port', 'en28BasePath', 'notifUri',
             'policyCounterIds', 'initialRetrieval', 'enableEn28',
@@ -971,22 +981,26 @@
         }
 
         function loadSavedSettings() {
-            const saved = localStorage.getItem(`sim_settings_${selectedProtocol}`);
-            if (saved) {
-                applySettings(JSON.parse(saved));
-                return;
-            }
-            // Fallback: try loading from server
+            // Server is the source of truth (persists across browser cache clears and
+            // reflects server-side provisioning). Fall back to localStorage if the
+            // server has nothing for this protocol.
             fetch('/api/settings')
                 .then(r => r.json())
                 .then(allSettings => {
-                    if (allSettings[selectedProtocol]) {
+                    if (allSettings && allSettings[selectedProtocol]) {
                         const settings = allSettings[selectedProtocol];
                         localStorage.setItem(`sim_settings_${selectedProtocol}`, JSON.stringify(settings));
                         applySettings(settings);
+                    } else {
+                        const saved = localStorage.getItem(`sim_settings_${selectedProtocol}`);
+                        if (saved) applySettings(JSON.parse(saved));
                     }
                 })
-                .catch(() => {}); // ignore if server unavailable
+                .catch(() => {
+                    // Server unavailable: use localStorage
+                    const saved = localStorage.getItem(`sim_settings_${selectedProtocol}`);
+                    if (saved) applySettings(JSON.parse(saved));
+                });
         }
 
         function applySettings(settings) {
@@ -1153,6 +1167,8 @@
                 config.origin_realm = document.getElementById('originRealm').value || null;
                 config.destination_host = document.getElementById('destinationHost').value || null;
                 config.destination_realm = document.getElementById('destinationRealm').value || null;
+                config.service_context_id = document.getElementById('serviceContextId').value || null;
+                config.auth_app_id = parseInt(document.getElementById('authApplicationId').value) || null;
             }
 
             fetch('/api/traffic/start', {
@@ -1593,6 +1609,8 @@
                 config.origin_realm = document.getElementById('originRealm').value || null;
                 config.destination_host = document.getElementById('destinationHost').value || null;
                 config.destination_realm = document.getElementById('destinationRealm').value || null;
+                config.service_context_id = document.getElementById('serviceContextId').value || null;
+                config.auth_app_id = parseInt(document.getElementById('authApplicationId').value) || null;
             }
 
             document.getElementById('btnManualCreate').disabled = true;

@@ -141,6 +141,11 @@ class ConsumptionEngine:
         self._metrics["current_tps"] = len(recent) / 5.0 if recent else 0.0
         return self._metrics.copy()
 
+    def record_manual(self, success: bool, latency_ms: float = 0.0):
+        """Record a manual-mode transaction into the dashboard metrics so the
+        success/failure counters reflect manual Create/Update/Release too."""
+        self._record(bool(success), float(latency_ms or 0.0))
+
     async def start(
         self,
         protocol,
@@ -291,11 +296,17 @@ class ConsumptionEngine:
                 any_triggered = False
 
                 for rg_id, rg_state in session.rating_groups.items():
-                    rg_state.used_total_volume += per_rg
-                    rg_state.used_downlink += int(per_rg * 0.7)
-                    rg_state.used_uplink += int(per_rg * 0.3)
+                    # Cap consumption at granted volume (can't use more than granted)
+                    if rg_state.granted_total_volume > 0:
+                        available = rg_state.granted_total_volume - rg_state.used_total_volume
+                        actual_consumed = min(per_rg, available)
+                    else:
+                        actual_consumed = per_rg
+                    rg_state.used_total_volume += actual_consumed
+                    rg_state.used_downlink += int(actual_consumed * 0.7)
+                    rg_state.used_uplink += actual_consumed - int(actual_consumed * 0.7)
                     rg_state.used_time += int(time_step)
-                    rg_state.cumulative_volume += per_rg
+                    rg_state.cumulative_volume += actual_consumed
                     rg_state.cumulative_time += int(time_step)
 
                     # Check triggers in priority order
@@ -355,6 +366,21 @@ class ConsumptionEngine:
                         break
 
             # === RELEASE ===
+            # If used counters are zero (after last _reset_used), simulate final
+            # consumption of remaining granted quota that hasn't been reported yet.
+            for rg_state in session.rating_groups.values():
+                if rg_state.used_total_volume == 0 and rg_state.granted_total_volume > 0:
+                    # Report remaining unreported usage (what was consumed since last update)
+                    # In reality, some data would have been used between last CCR-U and CCR-T
+                    # Cap at granted volume (3GPP: can't report more than granted)
+                    import random as _rnd
+                    final_usage = max(1, int(rg_state.granted_total_volume * _rnd.uniform(0.10, 0.50)))
+                    final_usage = min(final_usage, rg_state.granted_total_volume)
+                    rg_state.used_total_volume = final_usage
+                    rg_state.used_downlink = int(final_usage * 0.7)
+                    rg_state.used_uplink = final_usage - int(final_usage * 0.7)
+                    rg_state.cumulative_volume += final_usage
+
             session.invocation_sequence += 1
             used_units = self._build_used_units(session, include_requested=False, trigger_type="FINAL")
             success, latency, _ = await protocol.release_session(
@@ -497,11 +523,18 @@ class ConsumptionEngine:
         for rg_id, rg_state in session.rating_groups.items():
             rg_state.local_sequence_number += 1
 
+            # Hard cap: never report more than what was granted (3GPP compliance)
+            reported_total = rg_state.used_total_volume
+            if rg_state.granted_total_volume > 0:
+                reported_total = min(reported_total, rg_state.granted_total_volume)
+            reported_downlink = int(reported_total * 0.7)
+            reported_uplink = reported_total - reported_downlink
+
             used_container = {
                 "localSequenceNumber": rg_state.local_sequence_number,
-                "totalVolume": rg_state.used_total_volume,
-                "uplinkVolume": rg_state.used_uplink,
-                "downlinkVolume": rg_state.used_downlink,
+                "totalVolume": reported_total,
+                "uplinkVolume": reported_uplink,
+                "downlinkVolume": reported_downlink,
                 "quotaManagementIndicator": "ONLINE_CHARGING",
                 "triggerTimestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
                 "triggers": [

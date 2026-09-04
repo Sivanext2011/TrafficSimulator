@@ -26,10 +26,16 @@ logger = logging.getLogger(__name__)
 class CommandCode(IntEnum):
     CER = 257  # Capabilities-Exchange
     DWR = 280  # Device-Watchdog
-    CCR = 272  # Credit-Control
+    CCR = 272  # Credit-Control (standard 3GPP DCCA)
+    ERICSSON_CC = 16777214  # Ericsson CIP Credit-Control command (CBEV Gy via SDP)
     SLR = 8388635  # Spending-Limit (3GPP)
     ASR = 274  # Abort-Session
     RAR = 258  # Re-Auth
+
+
+# Ericsson AB Diameter vendor id and CIP charging application id.
+ERICSSON_VENDOR_ID = 193
+ERICSSON_CHARGING_CIP_APP_ID = 16777232
 
 
 class AVPCode(IntEnum):
@@ -51,6 +57,7 @@ class AVPCode(IntEnum):
     SUBSCRIPTION_ID_TYPE = 450
     SUBSCRIPTION_ID_DATA = 444
     MULTIPLE_SERVICES_CC = 456
+    MULTIPLE_SERVICES_INDICATOR = 455
     RATING_GROUP = 432
     SERVICE_IDENTIFIER = 439
     REQUESTED_SERVICE_UNIT = 437
@@ -62,10 +69,12 @@ class AVPCode(IntEnum):
     CC_TIME = 420
     SERVICE_INFORMATION = 873  # 3GPP
     PS_INFORMATION = 874  # 3GPP
+    SERVICE_CONTEXT_ID = 461  # Selects the charging service context (e.g. Gy: 32251@3gpp.org)
     TGPP_CHARGING_ID = 2
     CALLED_STATION_ID = 30
     TGPP_SGSN_MCC_MNC = 18
     TGPP_RAT_TYPE = 21
+    TGPP_USER_LOCATION_INFO = 22  # 3GPP-User-Location-Info (OctetString)
     ORIGIN_STATE_ID = 278
     EVENT_TIMESTAMP = 55
     TERMINATION_CAUSE = 295
@@ -164,6 +173,7 @@ def encode_diameter_message(
     end_to_end: int,
     avps: List[bytes],
     is_request: bool = True,
+    proxiable: bool = False,
 ) -> bytes:
     """Encode a full Diameter message (header + AVPs)."""
     avp_data = b"".join(avps)
@@ -176,6 +186,8 @@ def encode_diameter_message(
     flags = 0
     if is_request:
         flags |= 0x80  # R bit
+    if proxiable:
+        flags |= 0x40  # P bit (message may be proxied/relayed/redirected)
 
     # Flags (1) + Command Code (3)
     flags_and_cmd = (flags << 24) | (command_code & 0x00FFFFFF)
@@ -307,6 +319,9 @@ class DiameterTransport:
 
     async def connect(self) -> bool:
         """Establish TCP connection and perform CER/CEA exchange."""
+        # Drop any stale/half-open association before opening a fresh one.
+        if self._writer is not None or self._recv_task is not None:
+            await self.disconnect()
         try:
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port),
@@ -325,32 +340,66 @@ class DiameterTransport:
 
         except (OSError, asyncio.TimeoutError) as e:
             logger.error(f"Diameter connect failed: {e}")
-            self._connected = False
+            await self.disconnect()
             return False
 
+    async def ensure_connected(self) -> bool:
+        """Return True if a live association exists, otherwise (re)connect.
+
+        This detects a wedged/half-open socket left behind by a previous call
+        (e.g. after a WinError 64 / peer RST) and re-establishes a fresh
+        CER/CEA association instead of reusing a dead transport.
+        """
+        if self._connected and self._writer is not None and not self._writer.is_closing():
+            return True
+        return await self.connect()
+
+    def _fail_pending(self, exc: Exception) -> None:
+        """Resolve all in-flight request futures so callers fail fast instead
+        of waiting for the 30s timeout when the connection dies."""
+        pending, self._pending = self._pending, {}
+        for fut in pending.values():
+            if not fut.done():
+                fut.set_exception(exc)
+
     async def disconnect(self):
-        """Close the Diameter connection."""
+        """Close the Diameter connection and release all resources."""
         self._connected = False
         if self._recv_task:
             self._recv_task.cancel()
-        if self._writer:
-            self._writer.close()
             try:
+                await self._recv_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._recv_task = None
+        # Unblock any callers still waiting on an answer.
+        self._fail_pending(ConnectionError("Diameter connection closed"))
+        if self._writer:
+            try:
+                self._writer.close()
                 await self._writer.wait_closed()
             except Exception:
                 pass
         self._writer = None
         self._reader = None
 
-    async def send_request(self, command_code: int, app_id: int, avps: List[bytes]) -> Optional[dict]:
-        """Send a Diameter request and wait for the answer."""
-        if not self._connected:
+    async def send_request(self, command_code: int, app_id: int, avps: List[bytes],
+                           proxiable: bool = False) -> Optional[dict]:
+        """Send a Diameter request and wait for the answer.
+
+        proxiable: set the P-bit. Required for application messages (e.g. Gy/Ro
+        CCR) that must be relayed by the CHA Diameter Load Balancer to the
+        charging function. Base-protocol messages (CER, DWR) must NOT set it.
+        """
+        if not self._connected or self._writer is None or self._writer.is_closing():
+            logger.error("Diameter send skipped: no live connection")
             return None
 
         hbh = self._next_hop_by_hop()
         ete = self._next_end_to_end()
 
-        msg = encode_diameter_message(command_code, app_id, hbh, ete, avps, is_request=True)
+        msg = encode_diameter_message(command_code, app_id, hbh, ete, avps,
+                                      is_request=True, proxiable=proxiable)
 
         future = asyncio.get_event_loop().create_future()
         self._pending[hbh] = future
@@ -363,9 +412,17 @@ class DiameterTransport:
             answer = await asyncio.wait_for(future, timeout=30.0)
             return answer
 
-        except (asyncio.TimeoutError, OSError) as e:
+        except asyncio.TimeoutError:
+            logger.error(f"Diameter request timed out (cmd={command_code}): no answer within 30s")
+            self._pending.pop(hbh, None)
+            # A timeout means the association is unhealthy; tear it down so the
+            # next call reconnects instead of reusing a wedged socket.
+            await self.disconnect()
+            return None
+        except (OSError, ConnectionError) as e:
             logger.error(f"Diameter send failed: {e}")
             self._pending.pop(hbh, None)
+            await self.disconnect()
             return None
 
     async def _send_cer(self) -> bool:
@@ -378,18 +435,44 @@ class DiameterTransport:
             encode_utf8_avp(AVPCode.PRODUCT_NAME, self.product_name),
         ]
 
-        # Add auth application IDs
+        # Add auth application IDs. Standard app-ids (<= 0xFFFFFF and not vendor)
+        # go as plain Auth-Application-Id; Ericsson vendor app-ids (e.g. 16777232)
+        # must be advertised via Vendor-Specific-Application-Id { Vendor-Id 193, ... }.
         for app_id in self.auth_app_ids:
-            avps.append(encode_uint32_avp(AVPCode.AUTH_APPLICATION_ID, app_id))
+            if app_id >= 16777216:  # vendor-specific application id
+                avps.append(encode_grouped_avp(AVPCode.VENDOR_SPECIFIC_APP_ID, [
+                    encode_uint32_avp(AVPCode.VENDOR_ID, ERICSSON_VENDOR_ID),
+                    encode_uint32_avp(AVPCode.AUTH_APPLICATION_ID, app_id),
+                ]))
+            else:
+                avps.append(encode_uint32_avp(AVPCode.AUTH_APPLICATION_ID, app_id))
 
         answer = await self.send_request(CommandCode.CER, 0, avps)
-        if answer and answer.get("command_code") == CommandCode.CER:
-            # Check result code in AVPs
-            return True
-        return answer is not None
+        # A valid CEA is command 257 with the R-bit cleared (is_request False).
+        # Reject anything else so a wedged/misparsed response fails connect()
+        # instead of being treated as success.
+        if not answer:
+            return False
+        if answer.get("command_code") != CommandCode.CER or answer.get("is_request"):
+            logger.error(
+                f"Unexpected CER answer: cmd={answer.get('command_code')} "
+                f"is_request={answer.get('is_request')}"
+            )
+            return False
+        # Log the peer's advertised identity so we know the correct routing target.
+        try:
+            _peer = []
+            for avp in answer.get("avps", []):
+                if avp["code"] in (AVPCode.ORIGIN_HOST, AVPCode.ORIGIN_REALM):
+                    _peer.append(f"{AVPCode(avp['code']).name}={avp['data'].decode('utf-8','replace')}")
+            logger.debug(f"CEA peer identity: {', '.join(_peer)}")
+        except Exception:
+            pass
+        return True
 
     async def _receive_loop(self):
         """Background task to receive and dispatch Diameter messages."""
+        exc: Optional[Exception] = None
         try:
             while self._connected:
                 # Read header
@@ -406,6 +489,11 @@ class DiameterTransport:
                 avps = decode_avps(body_data)
                 header["avps"] = avps
 
+                logger.debug(
+                    f"RX cmd={header['command_code']} is_request={header['is_request']} "
+                    f"hbh={header['hop_by_hop']} len={header['length']} navps={len(avps)}"
+                )
+
                 if header["is_request"]:
                     # Handle incoming requests (DWR, etc.)
                     await self._handle_request(header)
@@ -416,20 +504,28 @@ class DiameterTransport:
                     if future and not future.done():
                         future.set_result(header)
 
-        except asyncio.IncompleteReadError:
+        except asyncio.IncompleteReadError as e:
             logger.info("Diameter connection closed by peer")
-            self._connected = False
+            exc = ConnectionError("connection closed by peer")
         except asyncio.CancelledError:
-            pass
+            # disconnect() cancelled us; it handles cleanup itself.
+            raise
         except Exception as e:
             logger.error(f"Diameter receive error: {e}")
+            exc = e
+        finally:
+            # Any exit other than an explicit cancel means the association is
+            # dead: mark disconnected AND unblock in-flight requests so callers
+            # fail fast instead of waiting for the 30s timeout.
             self._connected = False
+            self._fail_pending(exc or ConnectionError("Diameter receive loop ended"))
 
     async def _handle_request(self, msg: dict):
-        """Handle incoming Diameter requests (DWR → DWA)."""
+        """Handle incoming Diameter requests (DWR -> DWA)."""
         cmd = msg["command_code"]
+        logger.debug(f"Incoming request cmd={cmd} hbh={msg['hop_by_hop']}")
         if cmd == CommandCode.DWR:
-            # Send DWA
+            # DWA is command 280 (same as DWR) with the R-bit cleared.
             avps = [
                 encode_uint32_avp(AVPCode.RESULT_CODE, 2001),  # DIAMETER_SUCCESS
                 encode_utf8_avp(AVPCode.ORIGIN_HOST, self.origin_host),
@@ -439,9 +535,15 @@ class DiameterTransport:
                 CommandCode.DWR, 0, msg["hop_by_hop"], msg["end_to_end"],
                 avps, is_request=False
             )
-            if self._writer:
-                self._writer.write(answer)
-                await self._writer.drain()
+            if self._writer and not self._writer.is_closing():
+                try:
+                    self._writer.write(answer)
+                    await self._writer.drain()
+                except (OSError, ConnectionError) as e:
+                    # Failing to answer the watchdog means the peer will drop
+                    # us; surface it and let the association be torn down.
+                    logger.error(f"Failed to send DWA: {e}")
+                    self._connected = False
 
 
 # ─── Diameter Gy/Ro Client ────────────────────────────────────────────────────
@@ -468,6 +570,13 @@ class DiameterCCClient:
     ):
         self.subscriber = subscriber or {}
         self.auth_app_id = auth_app_id
+        # The ACTIVE CHA Gy service context (EricssonCharging-Ro-Gy, internal
+        # charging) matches Service-Context-Id CONTAINING "32251@3GPP.org"
+        # (note the UPPERCASE "3GPP"). Lowercase "3gpp.org" yields "No matching
+        # service context" -> 5031/5012. Standard CCR (272), Auth-Application-Id 4.
+        self.cc_command = CommandCode.CCR
+        self.cc_app_id = auth_app_id  # 4 for Gy
+        self.service_context_id = "32251@3GPP.org" if auth_app_id == 4 else "32260@3gpp.org"
         self._session_id: Optional[str] = None
         self._cc_request_number: int = 0
 
@@ -478,11 +587,12 @@ class DiameterCCClient:
             origin_realm=origin_realm,
             destination_host=destination_host,
             destination_realm=destination_realm,
-            auth_app_ids=[auth_app_id],
+            auth_app_ids=[self.cc_app_id],
         )
 
     async def connect(self) -> bool:
-        return await self._transport.connect()
+        # Detects and replaces a wedged/half-open transport instead of reusing it.
+        return await self._transport.ensure_connected()
 
     async def disconnect(self):
         await self._transport.disconnect()
@@ -559,6 +669,25 @@ class DiameterCCClient:
         mnc = self.subscriber.get("mnc", "92")
         ps_avps.append(encode_utf8_avp(AVPCode.TGPP_SGSN_MCC_MNC, mcc + mnc, TGPP_VENDOR_ID))
 
+        # 3GPP-RAT-Type (OctetString, vendor 10415). 6 = EUTRAN (matches production).
+        ps_avps.append(encode_avp(AVPCode.TGPP_RAT_TYPE, bytes([6]), TGPP_VENDOR_ID))
+
+        # 3GPP-User-Location-Info (OctetString, vendor 10415). The GyData
+        # enrichments normalize this for zone/roaming rating input. Build a
+        # minimal ECGI-type ULI: geoType(0x82=ECGI) + MCC/MNC (BCD) + ECI(4B).
+        def _bcd_plmn(mcc_s, mnc_s):
+            mcc_s = (mcc_s + "000")[:3]
+            mnc_s = (mnc_s + "00")[:3] if len(mnc_s) >= 3 else (mnc_s + "0")[:2]
+            d = mcc_s + ("f" if len(mnc_s) == 2 else "") + mnc_s
+            # nibble-swap per octet
+            out = bytearray()
+            for i in range(0, len(d), 2):
+                hi = d[i]; lo = d[i+1] if i + 1 < len(d) else 'f'
+                out.append((int(lo, 16) << 4) | int(hi, 16))
+            return bytes(out)
+        uli = bytes([0x82]) + _bcd_plmn(mcc, mnc) + bytes([0x00, 0x00, 0x00, 0x01])
+        ps_avps.append(encode_avp(AVPCode.TGPP_USER_LOCATION_INFO, uli, TGPP_VENDOR_ID))
+
         ps_info = encode_grouped_avp(AVPCode.PS_INFORMATION, ps_avps, TGPP_VENDOR_ID)
         return encode_grouped_avp(AVPCode.SERVICE_INFORMATION, [ps_info], TGPP_VENDOR_ID)
 
@@ -578,21 +707,44 @@ class DiameterCCClient:
         else:
             self._cc_request_number += 1
 
+        # A vendor-specific Application-Id (16777232, Ericsson) MUST be advertised
+        # via a grouped Vendor-Specific-Application-Id AVP { Vendor-Id 193,
+        # Auth-Application-Id }, not a bare Auth-Application-Id — otherwise CHA
+        # rejects with 5012 (Failed-AVP: Auth-Application-Id). Matches production capture.
+        if self.cc_app_id != 4:
+            app_id_avp = encode_grouped_avp(AVPCode.VENDOR_SPECIFIC_APP_ID, [
+                encode_uint32_avp(AVPCode.VENDOR_ID, ERICSSON_VENDOR_ID),
+                encode_uint32_avp(AVPCode.AUTH_APPLICATION_ID, self.cc_app_id),
+            ])
+        else:
+            app_id_avp = encode_uint32_avp(AVPCode.AUTH_APPLICATION_ID, self.cc_app_id)
+
+        # AVP order verified against OnlineRo_Gy dictionary (strict, ignoreMandatoryFlag=false):
+        # Session-Id, Origin-Host, Origin-Realm, Destination-Realm, (Vendor-Specific-)App-Id,
+        # Service-Context-Id, CC-Request-Number, CC-Request-Type, ...
         avps = [
             encode_utf8_avp(AVPCode.SESSION_ID, self._session_id),
             encode_utf8_avp(AVPCode.ORIGIN_HOST, self._transport.origin_host),
             encode_utf8_avp(AVPCode.ORIGIN_REALM, self._transport.origin_realm),
             encode_utf8_avp(AVPCode.DESTINATION_REALM, self._transport.destination_realm),
-            encode_uint32_avp(AVPCode.AUTH_APPLICATION_ID, self.auth_app_id),
-            encode_uint32_avp(AVPCode.CC_REQUEST_TYPE, request_type),
+            app_id_avp,
+            encode_utf8_avp(AVPCode.SERVICE_CONTEXT_ID, self.service_context_id),
             encode_uint32_avp(AVPCode.CC_REQUEST_NUMBER, self._cc_request_number),
+            encode_uint32_avp(AVPCode.CC_REQUEST_TYPE, request_type),
         ]
 
         if self._transport.destination_host:
             avps.append(encode_utf8_avp(AVPCode.DESTINATION_HOST, self._transport.destination_host))
 
-        # Subscription-Id
+        # Multiple-Services-Indicator = MULTIPLE_SERVICES_SUPPORTED (1), sent when MSCC is used.
+        if request_type in (CCRequestType.INITIAL, CCRequestType.UPDATE):
+            avps.append(encode_uint32_avp(AVPCode.MULTIPLE_SERVICES_INDICATOR, 1))
+
+        # Subscription-Id (MSISDN + IMSI)
         avps.extend(self._build_subscription_id())
+
+        # Event-Timestamp (seconds since 1900 per RFC 3588 time format)
+        avps.append(encode_uint32_avp(AVPCode.EVENT_TIMESTAMP, (int(time.time()) + 2208988800) & 0xFFFFFFFF))
 
         # MSCC
         avps.extend(self._build_mscc(rating_groups, request_type, used_units))
@@ -601,18 +753,34 @@ class DiameterCCClient:
         avps.append(self._build_service_information())
 
         start = time.perf_counter()
-        answer = await self._transport.send_request(CommandCode.CCR, self.auth_app_id, avps)
+        logger.debug(f"TX CCR type={int(request_type)} cmd={int(self.cc_command)} appid={self.cc_app_id} navps={len(avps)} scid={self.service_context_id} dest_realm={self._transport.destination_realm}")
+        answer = await self._transport.send_request(self.cc_command, self.cc_app_id, avps,
+                                                     proxiable=True)
         latency_ms = (time.perf_counter() - start) * 1000.0
 
         if answer is None:
             return False, latency_ms, None
 
-        # Parse result code from answer
+        # Parse top-level Result-Code from answer
         result_code = 0
         for avp in answer.get("avps", []):
             if avp["code"] == AVPCode.RESULT_CODE:
                 result_code = struct.unpack("!I", avp["data"][:4])[0] if len(avp["data"]) >= 4 else 0
                 break
 
-        success = result_code == 2001 or result_code == 0  # DIAMETER_SUCCESS or unparsed
-        return success, latency_ms, {"result_code": result_code, "answer": answer}
+        # Parse per-MSCC Result-Codes. A command-level 2001 can still carry a
+        # per-rating-group failure (e.g. 5031 RATING_FAILED with no granted
+        # units). Treat that as NOT successful so the UI/metrics reflect that
+        # no units were actually granted/deducted.
+        mscc_codes = []
+        for avp in answer.get("avps", []):
+            if avp["code"] == AVPCode.MULTIPLE_SERVICES_CC:
+                for inner in decode_avps(avp["data"]):
+                    if inner["code"] == AVPCode.RESULT_CODE and len(inner["data"]) >= 4:
+                        mscc_codes.append(struct.unpack("!I", inner["data"][:4])[0])
+
+        top_ok = result_code in (2001, 0)
+        mscc_ok = all(c == 2001 for c in mscc_codes) if mscc_codes else True
+        success = top_ok and mscc_ok
+        logger.debug(f"CCA result_code={result_code} mscc_codes={mscc_codes} success={success}")
+        return success, latency_ms, {"result_code": result_code, "mscc_result_codes": mscc_codes, "answer": answer}

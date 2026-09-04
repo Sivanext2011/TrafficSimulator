@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.consumption_engine import ConsumptionEngine
-from app.protocols.diameter_stack import DiameterCCClient, CCRequestType
+from app.protocols.diameter_stack import DiameterCCClient, CCRequestType, decode_avps
 from app.protocols.chf import ChfProtocol
 from app.protocols.pcf import PcfProtocol
 from app.protocols.diameter_gy import DiameterGyProtocol
@@ -60,6 +60,56 @@ en28_notifications: List[dict] = []
 en28_spending_limit_client: Optional[SpendingLimitClient] = None
 full_session_task: Optional[asyncio.Task] = None
 
+# Persistent Diameter clients, keyed by peer identity. The Diameter peer (DLB)
+# permits only ONE association per Origin-Host, so we must REUSE a single
+# connection across manual/create calls instead of opening a new one each time
+# (a second CER with the same Origin-Host is rejected as a duplicate peer,
+# causing the socket to be reset -> "Failed to connect to Diameter peer").
+_diameter_clients: dict = {}
+_diameter_clients_lock: Optional[asyncio.Lock] = None
+
+
+def _get_diameter_lock() -> asyncio.Lock:
+    global _diameter_clients_lock
+    if _diameter_clients_lock is None:
+        _diameter_clients_lock = asyncio.Lock()
+    return _diameter_clients_lock
+
+
+async def get_shared_diameter_client(
+    host, port, origin_host, origin_realm,
+    destination_host, destination_realm, auth_app_id, subscriber,
+    service_context_id=None,
+):
+    """Return a connected DiameterCCClient for this peer, reusing the existing
+    association if it is still alive, otherwise (re)connecting once."""
+    key = (host, int(port), origin_host, origin_realm, auth_app_id)
+    async with _get_diameter_lock():
+        client = _diameter_clients.get(key)
+        if client is not None:
+            # Keep subscriber current for this call, then verify liveness.
+            client.subscriber = subscriber or {}
+            if service_context_id:
+                client.service_context_id = service_context_id
+            if await client._transport.ensure_connected():
+                return client
+            # Stale/dead: drop it and fall through to create a fresh one.
+            _diameter_clients.pop(key, None)
+
+        client = DiameterCCClient(
+            host=host, port=port,
+            origin_host=origin_host, origin_realm=origin_realm,
+            destination_host=destination_host, destination_realm=destination_realm,
+            auth_app_id=auth_app_id, subscriber=subscriber,
+        )
+        # Allow an explicit Service-Context-Id override from the caller/UI.
+        if service_context_id:
+            client.service_context_id = service_context_id
+        if not await client.connect():
+            return None
+        _diameter_clients[key] = client
+        return client
+
 
 # ─── Session Handler Wrappers ─────────────────────────────────────────────────
 
@@ -98,6 +148,7 @@ class ChfSessionHandler:
         scheme = "https" if self.secure else "http"
         self._base_url = f"{scheme}://{self.fqdn}:{self.port}{self.base_path}"
         self._charging_data_ref: Optional[str] = None
+        self._charging_id: int = 0
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -126,6 +177,7 @@ class ChfSessionHandler:
         mnc = sub.get("mnc", "01")
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
         charging_id = int(time.time()) % 4294967295
+        self._charging_id = charging_id
 
         return {
             "subscriberIdentifier": sub.get("supi", f"imsi-{sub.get('imsi', '001010000000001')}"),
@@ -250,8 +302,8 @@ class ChfSessionHandler:
                 "nodeFunctionality": "SMF",
             },
             "pDUSessionChargingInformation": {
-                "chargingId": int(sub.get("charging_id", int(time.time()) % 4294967295)),
-                "homeProvidedChargingId": int(sub.get("charging_id", int(time.time()) % 4294967295)),
+                "chargingId": int(sub.get("charging_id", self._charging_id)),
+                "homeProvidedChargingId": int(sub.get("charging_id", self._charging_id)),
                 "userLocationinfo": {
                     "nrLocation": {
                         "tai": {
@@ -597,29 +649,75 @@ class DiameterSessionHandler:
             rating_groups=self._rating_groups,
             used_units=used_units,
         )
-        return success, latency_ms, response_data or {}
+        # Return a JSON-serializable summary. The raw diameter answer contains
+        # AVP payloads as bytes which FastAPI cannot serialize; expose only the
+        # result code and a clean grant summary (as update/create do).
+        result_code = response_data.get("result_code") if response_data else None
+        parsed = self._parse_diameter_grants(response_data)
+        parsed["resultCode"] = result_code
+        return success, latency_ms, parsed
 
     def get_session_ref(self) -> str:
         return self._session_ref
 
     def _parse_diameter_grants(self, response_data: Optional[dict]) -> dict:
-        """Convert Diameter CCA response to the multipleUnitInformation format
-        the consumption engine expects for grant parsing."""
+        """Convert a Diameter CCA into the multipleUnitInformation format the
+        engine expects, parsing the REAL Granted-Service-Unit AVPs from the
+        answer (not a hardcoded grant), so failed/zero grants are reported
+        truthfully instead of always showing a 10 MB success."""
         if not response_data:
-            return {}
+            return {"multipleUnitInformation": []}
 
-        # The engine expects: {"multipleUnitInformation": [{ratingGroup, grantedUnit: {totalVolume, time}}]}
-        # For now provide defaults since Diameter grant parsing from AVPs is complex
+        answer = response_data.get("answer") or {}
+        top_avps = answer.get("avps", []) if isinstance(answer, dict) else []
+
+        import struct as _struct
+
+        def _u32(b):
+            return _struct.unpack("!I", b[:4])[0] if len(b) >= 4 else 0
+
+        def _u64(b):
+            return _struct.unpack("!Q", b[:8])[0] if len(b) >= 8 else 0
+
         multi_unit_info = []
-        for rg in self._rating_groups:
+        # AVP codes: MSCC 456, Rating-Group 432, Result-Code 268,
+        # Granted-Service-Unit 431, CC-Total-Octets 421, CC-Time 420.
+        for avp in top_avps:
+            if avp.get("code") != 456:  # Multiple-Services-Credit-Control
+                continue
+            inner = decode_avps(avp.get("data", b""))
+            rg = rc = total_vol = time_grant = None
+            for iavp in inner:
+                c = iavp["code"]; d = iavp["data"]
+                if c == 432:
+                    rg = _u32(d)
+                elif c == 268:
+                    rc = _u32(d)
+                elif c == 431:  # Granted-Service-Unit (grouped)
+                    for g in decode_avps(d):
+                        if g["code"] == 421:
+                            total_vol = _u64(g["data"])
+                        elif g["code"] == 420:
+                            time_grant = _u32(g["data"])
             multi_unit_info.append({
-                "ratingGroup": rg,
-                "resultCode": "SUCCESS",
+                "ratingGroup": rg if rg is not None else (self._rating_groups[0] if self._rating_groups else 0),
+                "resultCode": "SUCCESS" if (rc in (None, 2001)) else str(rc),
                 "grantedUnit": {
-                    "totalVolume": 10 * 1024 * 1024,  # 10 MB default
-                    "time": 300,
+                    "totalVolume": total_vol if total_vol is not None else 0,
+                    "time": time_grant if time_grant is not None else 0,
                 },
             })
+
+        # No MSCC/grant in the CCA -> report a zero grant with the top-level
+        # result code so the UI reflects reality (accepted but nothing granted).
+        if not multi_unit_info:
+            top_rc = response_data.get("result_code")
+            for rg in self._rating_groups:
+                multi_unit_info.append({
+                    "ratingGroup": rg,
+                    "resultCode": "SUCCESS" if top_rc in (None, 2001) else str(top_rc),
+                    "grantedUnit": {"totalVolume": 0, "time": 0},
+                })
 
         return {"multipleUnitInformation": multi_unit_info}
 
@@ -662,6 +760,8 @@ class TrafficConfig(BaseModel):
     origin_realm: Optional[str] = None
     destination_host: Optional[str] = None
     destination_realm: Optional[str] = None
+    service_context_id: Optional[str] = None
+    auth_app_id: Optional[int] = None
 
 
 class SpeedUpdate(BaseModel):
@@ -829,23 +929,19 @@ async def start_traffic(config: TrafficConfig):
             destination_host = config.destination_host or diameter_host
             destination_realm = config.destination_realm or "operator.com"
 
-            auth_app_id = 4  # Default Gy/Ro
-            if protocol_name == "sy":
-                auth_app_id = 16777302
+            auth_app_id = config.auth_app_id or (16777302 if protocol_name == "sy" else 4)
 
-            diameter_client = DiameterCCClient(
-                host=diameter_host,
-                port=diameter_port,
-                origin_host=origin_host,
-                origin_realm=origin_realm,
-                destination_host=destination_host,
-                destination_realm=destination_realm,
-                auth_app_id=auth_app_id,
-                subscriber=config.subscriber.model_dump(),
+            # Reuse the shared, persistent association (the DLB rejects a duplicate
+            # connection from the same Origin-Host) and honor the Service-Context-Id
+            # override so traffic uses the same working parameters as manual mode.
+            diameter_client = await get_shared_diameter_client(
+                host=diameter_host, port=diameter_port,
+                origin_host=origin_host, origin_realm=origin_realm,
+                destination_host=destination_host, destination_realm=destination_realm,
+                auth_app_id=auth_app_id, subscriber=config.subscriber.model_dump(),
+                service_context_id=config.service_context_id,
             )
-
-            connected = await diameter_client.connect()
-            if not connected:
+            if diameter_client is None:
                 return {"error": f"Failed to connect to Diameter peer at {diameter_host}:{diameter_port}"}
 
             handler = DiameterSessionHandler(diameter_client)
@@ -943,6 +1039,8 @@ class ManualSessionCreate(BaseModel):
     origin_realm: Optional[str] = None
     destination_host: Optional[str] = None
     destination_realm: Optional[str] = None
+    service_context_id: Optional[str] = None
+    auth_app_id: Optional[int] = None
 
 
 class ManualSessionUpdate(BaseModel):
@@ -1000,8 +1098,8 @@ async def manual_create_session(config: ManualSessionCreate):
             )
         elif protocol_name in ("gy", "ro", "sy"):
             diameter_host = config.diameter_host or fqdn
-            auth_app_id = 16777302 if protocol_name == "sy" else 4
-            diameter_client = DiameterCCClient(
+            auth_app_id = config.auth_app_id or (16777302 if protocol_name == "sy" else 4)
+            diameter_client = await get_shared_diameter_client(
                 host=diameter_host,
                 port=config.diameter_port or 3868,
                 origin_host=config.origin_host or "telecom-simulator.local",
@@ -1010,9 +1108,9 @@ async def manual_create_session(config: ManualSessionCreate):
                 destination_realm=config.destination_realm or "operator.com",
                 auth_app_id=auth_app_id,
                 subscriber=config.subscriber.model_dump(),
+                service_context_id=config.service_context_id,
             )
-            connected = await diameter_client.connect()
-            if not connected:
+            if diameter_client is None:
                 return {"error": f"Failed to connect to Diameter peer at {diameter_host}:{config.diameter_port}"}
             handler = DiameterSessionHandler(diameter_client)
         else:
@@ -1022,6 +1120,13 @@ async def manual_create_session(config: ManualSessionCreate):
         start_time = time.perf_counter()
         success, latency_ms, response_data = await handler.create_session(config.rating_groups)
         session_ref = handler.get_session_ref()
+
+        # Feed dashboard metrics (manual mode counts toward success/failure too)
+        consumption_engine.record_manual(success, latency_ms)
+        try:
+            await broadcast_metrics(consumption_engine.get_metrics())
+        except Exception:
+            pass
 
         # Generate session ID
         session_id = f"manual_{protocol_name}_{int(time.time())}_{id(handler) % 10000}"
@@ -1104,6 +1209,11 @@ async def manual_update_session(config: ManualSessionUpdate):
         )
 
         session["state"] = "updated" if success else "update_failed"
+        consumption_engine.record_manual(success, latency_ms)
+        try:
+            await broadcast_metrics(consumption_engine.get_metrics())
+        except Exception:
+            pass
 
         # Record step
         step_record = {
@@ -1171,6 +1281,11 @@ async def manual_release_session(config: ManualSessionRelease):
         )
 
         session["state"] = "released" if success else "release_failed"
+        consumption_engine.record_manual(success, latency_ms)
+        try:
+            await broadcast_metrics(consumption_engine.get_metrics())
+        except Exception:
+            pass
 
         # Record step
         step_record = {
