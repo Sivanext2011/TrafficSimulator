@@ -51,6 +51,7 @@ class RatingGroupState:
     local_sequence_number: int = 0
     result_code: str = ""
     grant_timestamp: float = 0.0  # when the current grant was received
+    final_unit: bool = False  # Final-Unit-Indication received (last grant)
 
     # Trigger config for this rating group
     triggers: TriggerConfig = field(default_factory=TriggerConfig)
@@ -358,6 +359,13 @@ class ConsumptionEngine:
                             logger.info("All rating groups failed/exhausted — sending release")
                             break
 
+                        # Final-Unit-Indication: the OCS granted the last quota.
+                        # Consume it, then terminate (no further quota will be granted).
+                        if any(rg.final_unit for rg in session.rating_groups.values()):
+                            logger.info("Final-Unit-Indication received — consuming final grant then releasing")
+                            self._reset_used(session)
+                            break
+
                         # Reset consumed counters (cumulative keeps accumulating)
                         self._reset_used(session)
                     else:
@@ -455,12 +463,8 @@ class ConsumptionEngine:
         }
         """
         if not response_data:
-            # Default grant only if this is the first request (no result yet)
-            for rg_state in session.rating_groups.values():
-                if not rg_state.result_code:
-                    rg_state.granted_total_volume = 10 * 1024 * 1024  # 10MB default
-                    rg_state.granted_time = 300
-                    rg_state.grant_timestamp = time.time()
+            # No response to parse — do not fabricate a grant. Leave state as-is;
+            # the request path already recorded success/failure truthfully.
             return
 
         units_info = response_data.get("multipleUnitInformation", [])
@@ -484,11 +488,14 @@ class ConsumptionEngine:
                     rg_state.triggers.volume_quota_threshold = unit.get("volumeQuotaThreshold", 0)
                     rg_state.triggers.validity_time = unit.get("validityTime", 0)
                     rg_state.grant_timestamp = time.time()
+                    # Final-Unit-Indication: this is the last grant for this RG.
+                    rg_state.final_unit = bool(unit.get("finalUnitIndication") or unit.get("final"))
 
                     logger.info(
                         f"  RG {rg_id}: granted={rg_state.granted_total_volume} bytes, "
                         f"threshold={rg_state.triggers.volume_quota_threshold}, "
                         f"validityTime={rg_state.triggers.validity_time}s"
+                        + (" [FINAL-UNIT]" if rg_state.final_unit else "")
                     )
                 else:
                     # RATING_FAILED or other error — no grant

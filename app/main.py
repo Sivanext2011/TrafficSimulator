@@ -686,13 +686,18 @@ class DiameterSessionHandler:
             if avp.get("code") != 456:  # Multiple-Services-Credit-Control
                 continue
             inner = decode_avps(avp.get("data", b""))
-            rg = rc = total_vol = time_grant = None
+            rg = rc = total_vol = time_grant = validity = None
+            final = False
             for iavp in inner:
                 c = iavp["code"]; d = iavp["data"]
                 if c == 432:
                     rg = _u32(d)
                 elif c == 268:
                     rc = _u32(d)
+                elif c == 448:  # Validity-Time
+                    validity = _u32(d)
+                elif c == 430:  # Final-Unit-Indication (grouped)
+                    final = True
                 elif c == 431:  # Granted-Service-Unit (grouped)
                     for g in decode_avps(d):
                         if g["code"] == 421:
@@ -706,6 +711,8 @@ class DiameterSessionHandler:
                     "totalVolume": total_vol if total_vol is not None else 0,
                     "time": time_grant if time_grant is not None else 0,
                 },
+                "validityTime": validity if validity is not None else 0,
+                "finalUnitIndication": final,
             })
 
         # No MSCC/grant in the CCA -> report a zero grant with the top-level
