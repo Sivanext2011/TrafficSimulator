@@ -31,6 +31,38 @@ docker-compose up --build
 
 Access the UI at: http://localhost:8080
 
+### Running locally (dev)
+
+Docker (above) is the primary supported deployment. For quick local runs:
+
+```bash
+# Linux/macOS
+./run.sh
+# Windows (PowerShell)
+.\run.ps1              # foreground
+.\run.ps1 -Background  # detached
+```
+
+### Tests
+
+```bash
+pip install -r requirements.txt
+pytest -q
+```
+CI runs `pytest` on every push/PR (`.github/workflows/ci.yml`).
+
+### Diagnostics / operations APIs
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/diameter/status` | Per-peer connection/health (CER result, peer identity, reconnects, DWR/DWA, result-code breakdown) |
+| `GET /api/diameter/messages?limit&peer` | Recent Diameter TX/RX messages (decoded AVP summary + hex) |
+| `GET /api/logs/events?limit&level` | Last-N structured log events |
+| `GET/POST /api/logs/level` | Read/set runtime log level |
+| `GET /api/metrics` | Counters + latency p50/p95/p99 + result-code breakdown |
+| `GET/POST/DELETE /api/profiles[/name]` | Named integration profiles (multi-environment) |
+
+
 ## Configuration
 
 Upload certificates and configure endpoints via the web UI, or mount them as volumes:

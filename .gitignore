@@ -15,3 +15,10 @@ certs/
 .vscode/
 *.swp
 *.swo
+
+# Runtime / environment-specific config and capture artifacts
+config/
+*.pcap
+server_out.log
+server_err.log
+.pytest_cache/
