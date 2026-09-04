@@ -467,11 +467,12 @@
 
             <!-- ═══ INTEGRATION TAB ═══ -->
             <div class="tab-content" id="tabIntegration">
-                <div class="card">
+                <div class="card" id="endpointCard">
                     <h3>Endpoint</h3>
                     <div class="form-group">
                         <label>FQDN</label>
                         <input type="text" id="fqdn" placeholder="e.g. chf.example.com">
+                        <small id="fqdnHint" style="color:var(--text-secondary);font-size:0.72rem;"></small>
                     </div>
                     <div class="form-row">
                         <div class="form-group">
@@ -500,8 +501,9 @@
                     <h3>Diameter Connection</h3>
                     <div class="form-row">
                         <div class="form-group">
-                            <label>Diameter Host (IP/FQDN)</label>
+                            <label>Diameter Peer Address (IP/FQDN to connect)</label>
                             <input type="text" id="diameterHost" placeholder="10.0.0.1">
+                            <small style="color:var(--text-secondary);font-size:0.72rem;">TCP/SCTP transport address of the peer (e.g. the DLB IP). Not an AVP.</small>
                         </div>
                         <div class="form-group">
                             <label>Diameter Port</label>
@@ -520,8 +522,9 @@
                     </div>
                     <div class="form-row">
                         <div class="form-group">
-                            <label>Destination-Host</label>
-                            <input type="text" id="destinationHost" placeholder="ocs.operator.com">
+                            <label>Destination-Host (AVP 293, optional)</label>
+                            <input type="text" id="destinationHost" placeholder="leave blank for realm routing">
+                            <small style="color:var(--text-secondary);font-size:0.72rem;">Logical peer identity AVP. Leave blank to route by Destination-Realm.</small>
                         </div>
                         <div class="form-group">
                             <label>Destination-Realm</label>
@@ -937,10 +940,15 @@
 
         function toggleDiameterFields() {
             const diameterSection = document.getElementById('diameterFields');
-            if (diameterProtocols.includes(selectedProtocol)) {
+            const fqdnHint = document.getElementById('fqdnHint');
+            const isDiameter = diameterProtocols.includes(selectedProtocol);
+            if (isDiameter) {
                 diameterSection.classList.add('visible');
+                if (fqdnHint) fqdnHint.textContent =
+                    'For Diameter (Gy/Ro/Sy), the connection uses "Diameter Peer Address" below. This FQDN is only a fallback if that is blank.';
             } else {
                 diameterSection.classList.remove('visible');
+                if (fqdnHint) fqdnHint.textContent = 'SBI (HTTP/2) endpoint host, e.g. eric-bss-cha-access...';
             }
         }
 
