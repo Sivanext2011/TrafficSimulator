@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -70,7 +71,35 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Telecom Traffic Simulator", version="2.0.0")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """On (re)start, surface whether a previously used integration config is
+    available on disk so the operator knows they can reload it via
+    GET /api/traffic/last-config instead of re-entering everything."""
+    try:
+        cfg = _load_last_traffic_config()
+    except Exception:
+        cfg = None
+    if cfg:
+        logger.info(
+            "Loaded persisted integration config from %s "
+            "(protocol=%s, peer=%s:%s, service_context=%s). "
+            "Fetch via GET /api/traffic/last-config.",
+            LAST_TRAFFIC_FILE,
+            cfg.get("protocol"),
+            cfg.get("diameter_host") or (cfg.get("endpoint") or {}).get("fqdn"),
+            cfg.get("diameter_port") or (cfg.get("endpoint") or {}).get("port"),
+            cfg.get("service_context_id"),
+        )
+    else:
+        logger.info(
+            "No persisted integration config found; it will be saved "
+            "automatically the next time traffic is started."
+        )
+    yield
+
+
+app = FastAPI(title="Telecom Traffic Simulator", version="2.0.0", lifespan=_lifespan)
 
 CERT_DIR = Path("/app/certs")
 CERT_DIR.mkdir(parents=True, exist_ok=True)
@@ -200,14 +229,33 @@ class ChfSessionHandler:
         mcc = sub.get("mcc", "466")
         mnc = sub.get("mnc", "01")
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
-        charging_id = int(time.time()) % 4294967295
+        # chargingId must be stable for the whole PDU session. Allow an explicit
+        # subscriber override; otherwise generate once and reuse for update/release.
+        if sub.get("charging_id") is not None:
+            charging_id = int(sub["charging_id"])
+        elif self._charging_id:
+            charging_id = self._charging_id
+        else:
+            charging_id = int(time.time()) % 4294967295
         self._charging_id = charging_id
+
+        # AMBR / QoS defaults mirror the real SMF capture (rg1000 online trace)
+        sess_ambr_dl = sub.get("session_ambr_dl", "10 Gbps")
+        sess_ambr_ul = sub.get("session_ambr_ul", "10 Gbps")
+        arp = {
+            "preemptCap": sub.get("preempt_cap", "NOT_PREEMPT"),
+            "preemptVuln": sub.get("preempt_vuln", "PREEMPTABLE"),
+            "priorityLevel": int(sub.get("arp_priority", 12)),
+        }
+        qos_5qi = int(sub.get("5qi", 9))
 
         return {
             "subscriberIdentifier": sub.get("supi", f"imsi-{sub.get('imsi', '001010000000001')}"),
             "nfConsumerIdentification": {
                 "nFName": sub.get("nf_name", "423e4567-e89b-12d3-a456-426655440001"),
                 "nFIPv4Address": sub.get("nf_ip", "192.168.0.1"),
+                # Real SMF sends its FQDN as well
+                "nFFqdn": sub.get("nf_fqdn", "smf01.5gc.mnc001.mcc466.3gppnetwork.org"),
                 "nFPLMNID": {
                     "mcc": mcc,
                     "mnc": mnc,
@@ -216,7 +264,11 @@ class ChfSessionHandler:
             },
             "invocationTimeStamp": timestamp,
             "invocationSequenceNumber": 0,
-            "serviceSpecificationInfo": "32255_Dec-2020_Rel_16",
+            # Real SMF sends the notification callback URI for CHF-initiated reporting
+            "notifyUri": sub.get(
+                "notify_uri",
+                f"http://{sub.get('nf_ip', '192.168.0.1')}:9090/notifications/chf/convergedcharging/v2/referenceid/{charging_id}",
+            ),
             "multipleUnitUsage": [
                 {
                     "ratingGroup": rg,
@@ -247,9 +299,28 @@ class ChfSessionHandler:
                     "ratType": "NR",
                     "startTime": timestamp,
                     "sscMode": "SSC_MODE_1",
-                    "chargingCharacteristicsSelectionMode": "HOME_DEFAULT",
+                    # Real SMF includes chargingCharacteristics (hex string) + selection mode
+                    "chargingCharacteristics": sub.get("charging_characteristics", "0092"),
+                    "chargingCharacteristicsSelectionMode": sub.get(
+                        "cc_selection_mode", "HOME_DEFAULT"
+                    ),
                     "hPlmnId": {"mcc": mcc, "mnc": mnc},
                     "servingCNPlmnId": {"mcc": mcc, "mnc": mnc},
+                    # AMF details, as sent by the real SMF
+                    "servingNetworkFunctionID": {
+                        "aMFId": sub.get("amf_id", "80000B"),
+                        "servingNetworkFunctionInformation": {
+                            "nFFqdn": sub.get(
+                                "amf_fqdn", "amf01.amf.5gc.mnc001.mcc466.3gppnetwork.org"
+                            ),
+                            "nFIPv4Address": sub.get("amf_ip", "192.168.0.2"),
+                            "nFName": sub.get(
+                                "amf_name", "133ea1a8-fb18-46cb-8df6-ea53132fb178"
+                            ),
+                            "nFPLMNID": {"mcc": mcc, "mnc": mnc},
+                            "nodeFunctionality": "AMF",
+                        },
+                    },
                     "networkSlicingInfo": {
                         "sNSSAI": {
                             "sst": sub.get("slice_sst", 1),
@@ -257,21 +328,31 @@ class ChfSessionHandler:
                         }
                     },
                     "authorizedQoSInformation": {
-                        "5qi": int(sub.get("5qi", 9)),
-                        "arp": {
-                            "preemptCap": "MAY_PREEMPT",
-                            "preemptVuln": "PREEMPTABLE",
-                            "priorityLevel": 12,
+                        "5qi": qos_5qi,
+                        "arp": dict(arp),
+                        "authorizedSessionAMBR": {
+                            "downlink": sess_ambr_dl,
+                            "uplink": sess_ambr_ul,
+                        },
+                    },
+                    "subscribedQoSInformation": {
+                        "5qi": qos_5qi,
+                        "arp": dict(arp),
+                        "subscribedSessionAMBR": {
+                            "downlink": sess_ambr_dl,
+                            "uplink": sess_ambr_ul,
                         },
                     },
                     "pduAddress": {
+                        "iPv4dynamicAddressFlag": bool(sub.get("ipv4_dynamic", True)),
                         "pduIPv4Address": sub.get("pdu_ipv4", "10.20.30.40"),
                     },
                 },
                 "uetimeZone": sub.get("timezone", "+08:00"),
                 "userInformation": {
                     "servedGPSI": sub.get("gpsi", f"msisdn-{sub.get('msisdn', '12125551234')}"),
-                    "servedPEI": sub.get("pei", "imei-3577300601111100"),
+                    # Real SMF sends IMEISV, not IMEI
+                    "servedPEI": sub.get("pei", "imeisv-3525566012011313"),
                     "unauthenticatedFlag": False,
                 },
             },
@@ -295,6 +376,9 @@ class ChfSessionHandler:
                     "localSequenceNumber": c.get("localSequenceNumber", sequence),
                     "quotaManagementIndicator": "ONLINE_CHARGING",
                     "serviceId": int(sub.get("service_id", 100)),
+                    # Real SMF reports first/last usage timestamps in the container
+                    "timeofFirstUsage": c.get("timeofFirstUsage", timestamp),
+                    "timeofLastUsage": c.get("timeofLastUsage", timestamp),
                     "triggerTimestamp": timestamp,
                     "triggers": [
                         {
@@ -306,7 +390,8 @@ class ChfSessionHandler:
 
             mscc_list.append({
                 "ratingGroup": u["ratingGroup"],
-                "UsedUnitContainer": enriched_containers,
+                # 3GPP field name is lowercase 'usedUnitContainer' (matches real SMF)
+                "usedUnitContainer": enriched_containers,
                 "requestedUnit": {},
                 "uPFID": sub.get("upf_id", "123e4567-e89b-12d3-a456-426655440001"),
             })
@@ -314,11 +399,11 @@ class ChfSessionHandler:
         return {
             "invocationSequenceNumber": sequence,
             "invocationTimeStamp": timestamp,
-            "serviceSpecificationInfo": "32255_Dec-2020_Rel_16",
             "multipleUnitUsage": mscc_list,
             "nfConsumerIdentification": {
                 "nFIPv4Address": sub.get("nf_ip", "192.168.0.1"),
                 "nFName": sub.get("nf_name", "423e4567-e89b-12d3-a456-426655440001"),
+                "nFFqdn": sub.get("nf_fqdn", "smf01.5gc.mnc001.mcc466.3gppnetwork.org"),
                 "nFPLMNID": {
                     "mcc": mcc,
                     "mnc": mnc,
@@ -341,6 +426,11 @@ class ChfSessionHandler:
                     }
                 },
                 "uetimeZone": sub.get("timezone", "+08:00"),
+                "userInformation": {
+                    "servedGPSI": sub.get("gpsi", f"msisdn-{sub.get('msisdn', '12125551234')}"),
+                    "servedPEI": sub.get("pei", "imeisv-3525566012011313"),
+                    "unauthenticatedFlag": False,
+                },
             },
             "subscriberIdentifier": sub.get("supi", f"imsi-{sub.get('imsi', '001010000000001')}"),
         }
@@ -363,6 +453,8 @@ class ChfSessionHandler:
                     "localSequenceNumber": c.get("localSequenceNumber", sequence),
                     "quotaManagementIndicator": "ONLINE_CHARGING",
                     "serviceId": int(sub.get("service_id", 100)),
+                    "timeofFirstUsage": c.get("timeofFirstUsage", timestamp),
+                    "timeofLastUsage": c.get("timeofLastUsage", timestamp),
                     "triggerTimestamp": timestamp,
                     "triggers": [
                         {
@@ -374,23 +466,49 @@ class ChfSessionHandler:
 
             mscc_list.append({
                 "ratingGroup": u["ratingGroup"],
-                "UsedUnitContainer": enriched_containers,
+                # 3GPP field name is lowercase 'usedUnitContainer' (matches real SMF)
+                "usedUnitContainer": enriched_containers,
                 "uPFID": sub.get("upf_id", "123e4567-e89b-12d3-a456-426655440001"),
             })
 
         return {
             "invocationSequenceNumber": sequence,
             "invocationTimeStamp": timestamp,
-            "serviceSpecificationInfo": "32255_Dec-2020_Rel_16",
             "multipleUnitUsage": mscc_list,
             "nfConsumerIdentification": {
                 "nFIPv4Address": sub.get("nf_ip", "192.168.0.1"),
                 "nFName": sub.get("nf_name", "423e4567-e89b-12d3-a456-426655440001"),
+                "nFFqdn": sub.get("nf_fqdn", "smf01.5gc.mnc001.mcc466.3gppnetwork.org"),
                 "nFPLMNID": {
                     "mcc": mcc,
                     "mnc": mnc,
                 },
                 "nodeFunctionality": "SMF",
+            },
+            "pDUSessionChargingInformation": {
+                "chargingId": int(sub.get("charging_id", self._charging_id)),
+                "homeProvidedChargingId": int(sub.get("charging_id", self._charging_id)),
+                # Real SMF signals session stop on the final/release message
+                "sessionStopIndicator": True,
+                "stopTime": timestamp,
+                "userLocationinfo": {
+                    "nrLocation": {
+                        "tai": {
+                            "plmnId": {"mcc": mcc, "mnc": mnc},
+                            "tac": sub.get("tac", "000001"),
+                        },
+                        "ncgi": {
+                            "plmnId": {"mcc": mcc, "mnc": mnc},
+                            "nrCellId": sub.get("nr_cell_id", "000000001"),
+                        },
+                    }
+                },
+                "uetimeZone": sub.get("timezone", "+08:00"),
+                "userInformation": {
+                    "servedGPSI": sub.get("gpsi", f"msisdn-{sub.get('msisdn', '12125551234')}"),
+                    "servedPEI": sub.get("pei", "imeisv-3525566012011313"),
+                    "unauthenticatedFlag": False,
+                },
             },
             "subscriberIdentifier": sub.get("supi", f"imsi-{sub.get('imsi', '001010000000001')}"),
         }
@@ -432,6 +550,12 @@ class ChfSessionHandler:
 
     async def update_session(self, sequence: int, used_units: List[dict]):
         """Update a CHF session. Returns (success, latency_ms, response_dict)."""
+        if not self._charging_data_ref:
+            logger.error(
+                "CHF update_session aborted: no ChargingDataRef from CREATE. "
+                "The session was never established (create failed or returned no 'location')."
+            )
+            return False, 0.0, {}
         client = await self._get_client()
         url = f"{self._base_url}/chargingdata/{self._charging_data_ref}/update"
         payload = self._build_update_payload(sequence, used_units)
@@ -459,6 +583,12 @@ class ChfSessionHandler:
 
     async def release_session(self, sequence: int, used_units: List[dict]):
         """Release a CHF session. Returns (success, latency_ms, response_dict)."""
+        if not self._charging_data_ref:
+            logger.error(
+                "CHF release_session aborted: no ChargingDataRef from CREATE. "
+                "The session was never established (create failed or returned no 'location')."
+            )
+            return False, 0.0, {}
         client = await self._get_client()
         url = f"{self._base_url}/chargingdata/{self._charging_data_ref}/release"
         payload = self._build_release_payload(sequence, used_units)
@@ -819,6 +949,33 @@ SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 
 
+# Full last-used integration/traffic config, auto-saved on every /api/traffic/start
+# so it survives a process/container restart. This is the complete TrafficConfig
+# (peer host/port, realms, service-context, auth-app-id, subscriber, etc.), unlike
+# settings.json which only holds whatever the UI explicitly chooses to save.
+LAST_TRAFFIC_FILE = SETTINGS_DIR / "last_traffic.json"
+
+
+def _save_last_traffic_config(config) -> None:
+    """Persist the full TrafficConfig to disk (best-effort, never raises)."""
+    try:
+        data = config.model_dump() if hasattr(config, "model_dump") else config.dict()
+        LAST_TRAFFIC_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LAST_TRAFFIC_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception as exc:  # pragma: no cover - persistence must never break traffic
+        logger.warning(f"Could not persist last traffic config: {exc}")
+
+
+def _load_last_traffic_config() -> Optional[dict]:
+    """Load the last persisted TrafficConfig, or None if absent/unreadable."""
+    if LAST_TRAFFIC_FILE.exists():
+        try:
+            return json.loads(LAST_TRAFFIC_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, IOError):
+            return None
+    return None
+
+
 @app.get("/api/settings")
 async def get_settings():
     """Retrieve all saved settings from server-side storage."""
@@ -828,6 +985,17 @@ async def get_settings():
         except (json.JSONDecodeError, IOError):
             return {}
     return {}
+
+
+@app.get("/api/traffic/last-config")
+async def get_last_traffic_config():
+    """Return the full integration/traffic config last used to start traffic.
+
+    Persisted automatically on every /api/traffic/start, so it is available
+    again after a restart. Returns {} if nothing has been started yet.
+    """
+    cfg = _load_last_traffic_config()
+    return cfg if cfg is not None else {}
 
 
 @app.post("/api/settings")
@@ -952,6 +1120,10 @@ async def start_traffic(config: TrafficConfig):
             fqdn = fqdn[8:]
         fqdn = fqdn.rstrip("/")
         config.endpoint.fqdn = fqdn
+
+        # Persist the full integration/traffic config so it survives a restart.
+        # Best-effort: must never block or fail the actual traffic start.
+        _save_last_traffic_config(config)
 
         if protocol_name not in sbi_protocols and protocol_name not in diameter_protocols:
             return {"error": f"Unknown protocol: {config.protocol}"}
