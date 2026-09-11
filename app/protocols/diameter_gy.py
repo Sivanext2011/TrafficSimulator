@@ -77,7 +77,7 @@ class DiameterGyProtocol(BaseProtocol):
                 "3GPP-IMSI-MCC-MNC": f"{self.subscriber.get('mcc', '001')}{self.subscriber.get('mnc', '01')}",
                 "3GPP-GGSN-MCC-MNC": f"{self.subscriber.get('mcc', '001')}{self.subscriber.get('mnc', '01')}",
                 "3GPP-SGSN-MCC-MNC": f"{self.subscriber.get('mcc', '001')}{self.subscriber.get('mnc', '01')}",
-                "3GPP-User-Location-Info": self.subscriber.get("uli", "130184000100000001"),
+                "3GPP-User-Location-Info": self.subscriber.get("uli", "8164F62900000001"),
                 "3GPP-RAT-Type": self.subscriber.get("rat_type", "06"),  # EUTRAN
                 "3GPP-Selection-Mode": "0",
                 "Serving-Node-Type": "PGWC",

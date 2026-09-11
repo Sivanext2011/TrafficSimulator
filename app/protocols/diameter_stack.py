@@ -789,8 +789,16 @@ class DiameterCCClient:
         ps_avps.append(encode_avp(AVPCode.TGPP_RAT_TYPE, bytes([6]), TGPP_VENDOR_ID))
 
         # 3GPP-User-Location-Info (OctetString, vendor 10415). The GyData
-        # enrichments normalize this for zone/roaming rating input. Build a
-        # minimal ECGI-type ULI: geoType(0x82=ECGI) + MCC/MNC (BCD) + ECI(4B).
+        # enrichments normalize this for zone/roaming rating input and to derive
+        # eutraCellId (from ECI) and eutraTAC (from TAC).
+        #
+        # Per 3GPP TS 29.061/29.274 the Geographic-Location-Type byte defines
+        # the layout. We use type 0x82 = TAI+ECGI, which is 13 octets:
+        #   geoType(1) + PLMN(3 BCD) + TAC(2) + PLMN(3 BCD) + ECI(4)
+        # This carries BOTH the Tracking Area Code (-> eutraTAC) and the
+        # E-UTRAN Cell Id (-> eutraCellId). It must be the full 13 octets;
+        # a truncated type-0x82 value makes downstream normalization read past
+        # the end of the ECI and fail with a BitMask size mismatch.
         def _bcd_plmn(mcc_s, mnc_s):
             mcc_s = (mcc_s + "000")[:3]
             mnc_s = (mnc_s + "00")[:3] if len(mnc_s) >= 3 else (mnc_s + "0")[:2]
@@ -801,7 +809,16 @@ class DiameterCCClient:
                 hi = d[i]; lo = d[i+1] if i + 1 < len(d) else 'f'
                 out.append((int(lo, 16) << 4) | int(hi, 16))
             return bytes(out)
-        uli = bytes([0x82]) + _bcd_plmn(mcc, mnc) + bytes([0x00, 0x00, 0x00, 0x01])
+        plmn = _bcd_plmn(mcc, mnc)
+        # TAC (2 octets) and ECI (4 octets) are configurable via the subscriber;
+        # defaults give TAC=100 (0x0064) and ECI=1.
+        tac = int(self.subscriber.get("tac", 100)) & 0xFFFF
+        eci = int(self.subscriber.get("eci", 1)) & 0x0FFFFFFF
+        tac_bytes = tac.to_bytes(2, "big")
+        eci_bytes = eci.to_bytes(4, "big")
+        # geoType 0x82 (TAI+ECGI): PLMN + TAC + PLMN + ECI = 13 octets,
+        # e.g. 8264F629006464F62900000001
+        uli = bytes([0x82]) + plmn + tac_bytes + plmn + eci_bytes
         ps_avps.append(encode_avp(AVPCode.TGPP_USER_LOCATION_INFO, uli, TGPP_VENDOR_ID))
 
         ps_info = encode_grouped_avp(AVPCode.PS_INFORMATION, ps_avps, TGPP_VENDOR_ID)
