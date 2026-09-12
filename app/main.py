@@ -664,6 +664,29 @@ class ChfSessionHandler:
         except Exception as e:
             logger.debug(f"diag record error: {e}")
 
+    async def _post_with_retry(self, client, url, payload, retries: int = 2):
+        """POST with simple exponential backoff on transient transport errors
+        (connect/read timeouts, connection resets). Reuses the shared client.
+        Non-transient HTTP responses (including 4xx/5xx) are returned as-is —
+        only transport exceptions are retried."""
+        import httpx as _httpx
+        delay = 0.5
+        last_exc = None
+        for attempt in range(retries + 1):
+            try:
+                return await client.post(url, json=payload)
+            except (_httpx.ConnectError, _httpx.ConnectTimeout, _httpx.ReadTimeout,
+                    _httpx.RemoteProtocolError, _httpx.WriteError) as e:
+                last_exc = e
+                if attempt < retries:
+                    logger.warning(f"CHF POST transient error ({e.__class__.__name__}); "
+                                   f"retry {attempt+1}/{retries} in {delay:.1f}s")
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                else:
+                    raise
+        raise last_exc
+
     async def create_session(self, rating_groups: List[int]):
         """Create a CHF session. Returns (success, latency_ms, response_dict)."""
         client = await self._get_client()
@@ -675,7 +698,7 @@ class ChfSessionHandler:
 
         start = time.perf_counter()
         try:
-            response = await client.post(url, json=payload)
+            response = await self._post_with_retry(client, url, payload)
             latency_ms = (time.perf_counter() - start) * 1000.0
 
             logger.info(f"<<< CHF CREATE RESPONSE: status={response.status_code}, latency={latency_ms:.1f}ms")
@@ -717,7 +740,7 @@ class ChfSessionHandler:
 
         start = time.perf_counter()
         try:
-            response = await client.post(url, json=payload)
+            response = await self._post_with_retry(client, url, payload)
             latency_ms = (time.perf_counter() - start) * 1000.0
 
             logger.info(f"<<< CHF UPDATE RESPONSE: status={response.status_code}, latency={latency_ms:.1f}ms")
@@ -751,7 +774,7 @@ class ChfSessionHandler:
 
         start = time.perf_counter()
         try:
-            response = await client.post(url, json=payload)
+            response = await self._post_with_retry(client, url, payload)
             latency_ms = (time.perf_counter() - start) * 1000.0
 
             logger.info(f"<<< CHF RELEASE RESPONSE: status={response.status_code}, latency={latency_ms:.1f}ms")
@@ -1455,6 +1478,22 @@ async def get_chf_diagnostics():
 async def reset_chf_diagnostics():
     CHF_DIAG.reset()
     return {"status": "ok"}
+
+
+@app.get("/api/chf/capture")
+async def export_chf_capture():
+    """Export the captured CHF SBI request/response lifecycle as a JSON download
+    (feature #15). Includes the full timeline, taxonomy, and affinity warnings."""
+    payload = CHF_DIAG.get_status()
+    payload["exported_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    payload["timeline"] = CHF_DIAG.timeline  # full (not just last 100)
+    data = json.dumps(payload, indent=2)
+    fname = f"chf_capture_{int(time.time())}.json"
+    return Response(
+        content=data,
+        media_type="application/json",
+        headers={"Content-Disposition": f"attachment; filename={fname}"},
+    )
 
 
 class IdTranslationTest(BaseModel):
