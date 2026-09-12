@@ -103,6 +103,9 @@ class SessionState:
     # elapsed time passes 'at', an UPDATE is sent with that triggerType, once.
     event_triggers: List[dict] = field(default_factory=list)
     fired_event_indexes: set = field(default_factory=set)
+    # Set once the OCS returns a Final-Unit-Indication; the session then drains
+    # the full final grant before releasing.
+    final_unit_pending: bool = False
 
 
 class ConsumptionEngine:
@@ -317,7 +320,12 @@ class ConsumptionEngine:
                     # when balance remains — the bug this guards against.
                     if rg_state.granted_total_volume > 0:
                         thr = rg_state.triggers.volume_quota_threshold
-                        report_cap = (rg_state.granted_total_volume - thr) if thr > 0 else rg_state.granted_total_volume
+                        if session.final_unit_pending:
+                            # Final grant: allow consuming the ENTIRE grant so the
+                            # session drains it fully before releasing.
+                            report_cap = rg_state.granted_total_volume
+                        else:
+                            report_cap = (rg_state.granted_total_volume - thr) if thr > 0 else rg_state.granted_total_volume
                         report_cap = max(1, report_cap)
                         available = report_cap - rg_state.used_total_volume
                         actual_consumed = max(0, min(per_rg, available))
@@ -392,12 +400,21 @@ class ConsumptionEngine:
                             logger.info("All rating groups failed/exhausted — sending release")
                             break
 
-                        # Final-Unit-Indication: the OCS granted the last quota.
-                        # Consume it, then terminate (no further quota will be granted).
+                        # Final-Unit-Indication: the OCS granted the LAST quota.
+                        # Per 3GPP the SMF may consume the entire final grant and
+                        # only terminates once it is exhausted. So we do NOT break
+                        # here — we reset the reported counters and keep consuming
+                        # the (new) final grant in the loop. is_exhausted will then
+                        # end the loop once the full final grant has been used.
                         if any(rg.final_unit for rg in session.rating_groups.values()):
-                            logger.info("Final-Unit-Indication received — consuming final grant then releasing")
+                            logger.info(
+                                "Final-Unit-Indication received — consuming the final grant "
+                                f"({sum(rg.granted_total_volume for rg in session.rating_groups.values())} bytes) "
+                                "before releasing"
+                            )
+                            session.final_unit_pending = True
                             self._reset_used(session)
-                            break
+                            continue
 
                         # Reset consumed counters (cumulative keeps accumulating)
                         self._reset_used(session)
@@ -405,6 +422,13 @@ class ConsumptionEngine:
                         # HTTP error — stop and release
                         logger.warning("Update failed with HTTP error — terminating session")
                         break
+
+                # After a final grant, once it is fully consumed, terminate.
+                if session.final_unit_pending and all(
+                    rg.is_exhausted for rg in session.rating_groups.values() if rg.granted_total_volume > 0
+                ):
+                    logger.info("Final grant fully consumed — releasing")
+                    break
 
             # === RELEASE ===
             # If used counters are zero (after last _reset_used), simulate final

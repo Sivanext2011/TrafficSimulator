@@ -139,3 +139,73 @@ def test_update_never_reports_full_grant():
     assert handler.reported_totals[0] <= cap, (
         f"first update reported {handler.reported_totals[0]} > cap {cap}"
     )
+
+
+class FinalGrantHandler:
+    """CREATE grants a small quota; the FIRST update returns a large FINAL grant
+    with TERMINATE. Mirrors the real CHF trace. Records total reported volume."""
+    def __init__(self, first_grant, final_grant):
+        self.first_grant = first_grant
+        self.final_grant = final_grant
+        self.total_reported = 0
+        self.updates = 0
+        self.released = False
+        self._ref = "fup1"
+
+    async def create_session(self, rating_groups):
+        return True, 1.0, {"multipleUnitInformation": [{
+            "ratingGroup": rating_groups[0], "resultCode": "SUCCESS",
+            "grantedUnit": {"totalVolume": self.first_grant},
+            "validityTime": 1800, "volumeQuotaThreshold": self.first_grant // 10,
+        }], "triggers": []}
+
+    async def update_session(self, sequence, used_units):
+        self.updates += 1
+        for u in used_units:
+            for c in u.get("usedUnitContainer", []):
+                self.total_reported += c.get("totalVolume", 0)
+        # First update -> return the FINAL grant with TERMINATE.
+        return True, 1.0, {"multipleUnitInformation": [{
+            "ratingGroup": u["ratingGroup"], "resultCode": "SUCCESS",
+            "grantedUnit": {"totalVolume": self.final_grant},
+            "validityTime": 900, "volumeQuotaThreshold": self.final_grant // 10,
+            "finalUnitIndication": {"finalUnitAction": "TERMINATE"},
+        }]}
+
+    async def release_session(self, sequence, used_units):
+        for u in used_units:
+            for c in u.get("usedUnitContainer", []):
+                self.total_reported += c.get("totalVolume", 0)
+        self.released = True
+        return True, 1.0, {}
+
+    def get_session_ref(self):
+        return self._ref
+
+
+def test_final_grant_is_consumed_before_release():
+    """When the CHF returns a final grant with TERMINATE, the session must
+    consume (report) the full final grant before releasing — not bail out
+    immediately reporting a random fraction."""
+    first, final = 10_485_760, 283_362_786  # matches the real trace
+    async def _run():
+        engine = ConsumptionEngine()
+        handler = FinalGrantHandler(first, final)
+        await engine.start(
+            protocol=handler,
+            speed_mbps=1000.0,   # fast so the final grant drains within the window
+            num_sessions=1,
+            rating_groups=[1000],
+            session_duration_sec=10,
+        )
+        await asyncio.sleep(6)
+        await engine.stop()
+        return handler
+
+    handler = asyncio.run(_run())
+    assert handler.released is True
+    # The total reported across update(s)+release must cover the final grant,
+    # i.e. the ~283 MB final grant was actually consumed (allow small rounding).
+    assert handler.total_reported >= final * 0.95, (
+        f"final grant not consumed: reported {handler.total_reported} of {final}"
+    )
