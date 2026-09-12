@@ -1545,6 +1545,71 @@ async def chf_id_translation_test(cfg: IdTranslationTest):
     return {"base_path": base_path, "fqdn": fqdn, "results": results}
 
 
+class ChfAssertion(BaseModel):
+    """Send a CHF CREATE and assert the response matches expectations (feature #6)."""
+    fqdn: str
+    port: int = 80
+    base_path: Optional[str] = None
+    secure: bool = False
+    verify_ssl: bool = False
+    subscriber: SubscriberConfig = SubscriberConfig()
+    rating_groups: List[int] = [1000]
+    expect_status: Optional[int] = None        # e.g. 201
+    expect_cause: Optional[str] = None         # e.g. "USER_UNKNOWN"
+    expect_grant: Optional[bool] = None        # True => require a non-zero grant
+
+
+@app.post("/api/chf/assert")
+async def chf_assert(cfg: ChfAssertion):
+    """Run one CHF CREATE and evaluate pass/fail against expected values."""
+    fqdn = cfg.fqdn.strip()
+    for pre in ("http://", "https://"):
+        if fqdn.startswith(pre):
+            fqdn = fqdn[len(pre):]
+    fqdn = fqdn.rstrip("/")
+    base_path = cfg.base_path or "/nchf-convergedcharging/v3"
+
+    handler = ChfSessionHandler(
+        fqdn=fqdn, port=cfg.port, base_path=base_path,
+        cert_path=None, key_path=None, ca_path=None,
+        subscriber=cfg.subscriber.model_dump(), secure=cfg.secure, verify_ssl=cfg.verify_ssl,
+    )
+    success, latency_ms, resp = await handler.create_session(cfg.rating_groups)
+    last = CHF_DIAG.timeline[-1] if CHF_DIAG.timeline else {}
+    actual_status = last.get("status")
+    actual_cause = last.get("cause")
+    granted = 0
+    for u in (resp or {}).get("multipleUnitInformation", []):
+        granted += (u.get("grantedUnit", {}) or {}).get("totalVolume", 0)
+
+    checks = []
+    def chk(name, ok, expected, actual):
+        checks.append({"check": name, "pass": bool(ok), "expected": expected, "actual": actual})
+
+    if cfg.expect_status is not None:
+        chk("status", actual_status == cfg.expect_status, cfg.expect_status, actual_status)
+    if cfg.expect_cause is not None:
+        chk("cause", actual_cause == cfg.expect_cause, cfg.expect_cause, actual_cause)
+    if cfg.expect_grant is not None:
+        chk("grant", (granted > 0) == cfg.expect_grant, cfg.expect_grant, granted)
+
+    try:
+        await handler.close()
+    except Exception:
+        pass
+
+    overall = all(c["pass"] for c in checks) if checks else success
+    return {
+        "overall_pass": overall,
+        "success": success,
+        "status": actual_status,
+        "cause": actual_cause,
+        "granted_total": granted,
+        "latency_ms": round(latency_ms, 2),
+        "checks": checks,
+    }
+
+
 @app.post("/api/traffic/speed")
 async def update_speed(update: SpeedUpdate):
     """Update the simulated download speed in real time (slider changes)."""

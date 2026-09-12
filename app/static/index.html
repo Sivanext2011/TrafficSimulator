@@ -486,6 +486,17 @@
                     </div>
                     <div class="form-row">
                         <div class="form-group">
+                            <label>Nchf Version</label>
+                            <select id="nchfVersion" onchange="onNchfVersionChange()">
+                                <option value="">(manual base path)</option>
+                                <option value="v3" selected>v3</option>
+                                <option value="v2">v2</option>
+                            </select>
+                        </div>
+                        <div class="form-group"></div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
                             <label><input type="checkbox" id="secure" checked> HTTPS (TLS)</label>
                         </div>
                         <div class="form-group">
@@ -610,6 +621,19 @@
                 <div class="card">
                     <h3>Subscriber</h3>
                     <div class="form-row">
+                        <div class="form-group" style="flex:1;">
+                            <label>Archetype preset</label>
+                            <select id="archetype" onchange="applyArchetype()">
+                                <option value="">(custom)</option>
+                                <option value="consumer">Consumer (IMSI + MSISDN)</option>
+                                <option value="iot_extid">IoT — External ID (no MSISDN)</option>
+                                <option value="nbiot">NB-IoT — MSISDN-less (IMSI)</option>
+                                <option value="wireline_gci">Wireline — GCI</option>
+                                <option value="wireline_gli">Wireline — GLI</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="form-row">
                         <div class="form-group">
                             <label>MSISDN</label>
                             <input type="text" id="msisdn" placeholder="14155551234">
@@ -669,6 +693,20 @@
                         <div class="form-group">
                             <label>MNC</label>
                             <input type="text" id="mnc" placeholder="260">
+                        </div>
+                    </div>
+                    <div class="form-row-3">
+                        <div class="form-group">
+                            <label>5QI</label>
+                            <input type="number" id="qos5qi" placeholder="9">
+                        </div>
+                        <div class="form-group">
+                            <label>ARP Priority</label>
+                            <input type="number" id="arpPriority" placeholder="12">
+                        </div>
+                        <div class="form-group">
+                            <label>Session AMBR (DL / UL)</label>
+                            <input type="text" id="sessionAmbr" placeholder="10 Gbps / 10 Gbps">
                         </div>
                     </div>
                 </div>
@@ -920,7 +958,52 @@
             if (t === 'gci')   out.gci = v || '0011223344556677';
             if (t === 'gli')   out.gli = v || 'bng-volth-1/1/0/36';
             if (pei) out.pei = pei;
+            Object.assign(out, buildQosFields());
             return out;
+        }
+
+        // QoS / S-NSSAI subscriber fields (feature #12).
+        function buildQosFields() {
+            const out = {};
+            const q = (document.getElementById('qos5qi') || {}).value;
+            const arp = (document.getElementById('arpPriority') || {}).value;
+            const ambr = (document.getElementById('sessionAmbr') || {}).value || '';
+            if (q) out['5qi'] = parseInt(q);
+            if (arp) out['arp_priority'] = parseInt(arp);
+            if (ambr.includes('/')) {
+                const [dl, ul] = ambr.split('/').map(s => s.trim());
+                if (dl) out['session_ambr_dl'] = dl;
+                if (ul) out['session_ambr_ul'] = ul;
+            }
+            return out;
+        }
+
+        // Nchf version toggle (feature #5): auto-fill base path.
+        function onNchfVersionChange() {
+            const v = (document.getElementById('nchfVersion') || {}).value;
+            if (!v) return;
+            const bp = document.getElementById('basePath');
+            if (bp) bp.value = `/nchf-convergedcharging/${v}`;
+        }
+
+        // Subscriber archetype presets (feature #11).
+        const SUBSCRIBER_ARCHETYPES = {
+            consumer:   { id_type: 'imsi',   dnn: 'internet', slice_sst: 1, qos5qi: 9 },
+            iot_extid:  { id_type: 'extid',  idValue: 'device1@iot.operator.com', dnn: 'iot', slice_sst: 2, qos5qi: 9 },
+            nbiot:      { id_type: 'imsi',   dnn: 'nbiot', slice_sst: 2, qos5qi: 9 },   // MSISDN-less
+            wireline_gci: { id_type: 'gci',  idValue: '0011223344556677', dnn: 'internet', slice_sst: 1, qos5qi: 9 },
+            wireline_gli: { id_type: 'gli',  idValue: 'bng-volth-1/1/0/36', dnn: 'internet', slice_sst: 1, qos5qi: 9 },
+        };
+        function applyArchetype() {
+            const key = (document.getElementById('archetype') || {}).value;
+            const a = SUBSCRIBER_ARCHETYPES[key];
+            if (!a) return;
+            if (document.getElementById('idType')) document.getElementById('idType').value = a.id_type;
+            if (a.idValue && document.getElementById('idValue')) document.getElementById('idValue').value = a.idValue;
+            if (a.dnn && document.getElementById('dnn')) document.getElementById('dnn').value = a.dnn;
+            if (a.slice_sst && document.getElementById('sliceSST')) document.getElementById('sliceSST').value = a.slice_sst;
+            if (a.qos5qi && document.getElementById('qos5qi')) document.getElementById('qos5qi').value = a.qos5qi;
+            onIdTypeChange();
         }
 
         let ws = null;
