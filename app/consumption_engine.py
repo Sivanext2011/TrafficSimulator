@@ -98,6 +98,12 @@ class SessionState:
     # Session-level triggers (from CHF Create response)
     session_triggers: TriggerConfig = field(default_factory=TriggerConfig)
 
+    # Scheduled event triggers to simulate (feature #4): list of
+    # {"at": <elapsed_seconds:int>, "type": <triggerType:str>}. When the session
+    # elapsed time passes 'at', an UPDATE is sent with that triggerType, once.
+    event_triggers: List[dict] = field(default_factory=list)
+    fired_event_indexes: set = field(default_factory=set)
+
 
 class ConsumptionEngine:
     """Simulates data consumption and drives charging session lifecycle.
@@ -126,6 +132,7 @@ class ConsumptionEngine:
         }
         self._latencies: List[float] = []
         self._request_times: List[float] = []
+        self._event_triggers: List[dict] = []
 
     @property
     def speed_mbps(self) -> float:
@@ -155,6 +162,7 @@ class ConsumptionEngine:
         rating_groups: List[int],
         session_duration_sec: int = 300,
         metrics_callback: Callable = None,
+        event_triggers: Optional[List[dict]] = None,
     ):
         """Start the consumption simulation.
 
@@ -165,10 +173,13 @@ class ConsumptionEngine:
             rating_groups: List of rating group IDs to use
             session_duration_sec: How long each session lasts
             metrics_callback: Async function called with metrics updates
+            event_triggers: Optional list of {"at": seconds, "type": triggerType}
+                to simulate mid-session event reports (RAT_CHANGE, PLMN_CHANGE, ...)
         """
         if self._running:
             await self.stop()
 
+        self._event_triggers = list(event_triggers or [])
         self._speed_mbps = speed_mbps
         self._running = True
         self._metrics["state"] = "running"
@@ -236,6 +247,7 @@ class ConsumptionEngine:
             rating_groups={rg: RatingGroupState(rating_group=rg) for rg in rating_groups},
             start_time=time.time(),
             last_update_time=time.time(),
+            event_triggers=list(self._event_triggers),
         )
         self._metrics["active_sessions"] += 1
 
@@ -327,6 +339,19 @@ class ConsumptionEngine:
                     if total_cumulative >= session.session_triggers.volume_limit:
                         trigger_type = "VOLUME_LIMIT"
                         any_triggered = True
+
+                # Check scheduled event triggers (feature #4): fire an UPDATE with
+                # the configured triggerType (e.g. RAT_CHANGE) once its time arrives.
+                if not any_triggered and session.event_triggers:
+                    for idx, ev in enumerate(session.event_triggers):
+                        if idx in session.fired_event_indexes:
+                            continue
+                        if elapsed >= float(ev.get("at", 0)):
+                            trigger_type = str(ev.get("type", "RAT_CHANGE"))
+                            any_triggered = True
+                            session.fired_event_indexes.add(idx)
+                            logger.info(f"Event trigger fired at {elapsed:.0f}s: {trigger_type}")
+                            break
 
                 # Update total consumption metric
                 total_consumed = sum(rg.cumulative_volume for rg in session.rating_groups.values())

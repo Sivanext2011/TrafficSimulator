@@ -696,6 +696,12 @@
                             <input type="number" id="numSessions" placeholder="1" value="1">
                         </div>
                     </div>
+                    <div class="form-row">
+                        <div class="form-group" style="flex:1;">
+                            <label>Event Triggers (optional) — e.g. 10:RAT_CHANGE, 20:PLMN_CHANGE</label>
+                            <input type="text" id="eventTriggers" placeholder="seconds:TRIGGER_TYPE, comma-separated">
+                        </div>
+                    </div>
                     <div class="btn-group">
                         <button class="btn btn-start" onclick="startTraffic()">&#9654; Start</button>
                         <button class="btn btn-stop" onclick="stopTraffic()">&#9632; Stop</button>
@@ -1301,6 +1307,14 @@
                 session_duration_sec: parseInt(document.getElementById('sessionDuration').value) || 300,
                 num_sessions: parseInt(document.getElementById('numSessions').value) || 1
             };
+
+            // Parse optional event triggers "10:RAT_CHANGE, 20:PLMN_CHANGE" (feature #4)
+            const etRaw = (document.getElementById('eventTriggers') || {}).value || '';
+            const events = etRaw.split(',').map(s => s.trim()).filter(Boolean).map(s => {
+                const [at, type] = s.split(':').map(x => (x || '').trim());
+                return { at: parseInt(at) || 0, type: type || 'RAT_CHANGE' };
+            });
+            if (events.length) config.event_triggers = events;
 
             // Add diameter fields if diameter protocol selected
             if (diameterProtocols.includes(selectedProtocol)) {

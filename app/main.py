@@ -1093,6 +1093,9 @@ class TrafficConfig(BaseModel):
     destination_realm: Optional[str] = None
     service_context_id: Optional[str] = None
     auth_app_id: Optional[int] = None
+    # Feature #4: scheduled mid-session event triggers, e.g.
+    # [{"at": 10, "type": "RAT_CHANGE"}, {"at": 20, "type": "PLMN_CHANGE"}]
+    event_triggers: Optional[List[dict]] = None
 
 
 class SpeedUpdate(BaseModel):
@@ -1375,6 +1378,7 @@ async def start_traffic(config: TrafficConfig):
             rating_groups=config.rating_groups,
             session_duration_sec=config.session_duration_sec,
             metrics_callback=broadcast_metrics,
+            event_triggers=config.event_triggers,
         )
 
         return {
