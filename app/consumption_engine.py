@@ -309,10 +309,18 @@ class ConsumptionEngine:
                 any_triggered = False
 
                 for rg_id, rg_state in session.rating_groups.items():
-                    # Cap consumption at granted volume (can't use more than granted)
+                    # Cap consumption so a single interval never reports the ENTIRE
+                    # grant. Report at the quota-threshold point (granted - threshold)
+                    # if a threshold was given; otherwise cap at the full grant.
+                    # Reporting 100% of the grant in one tick makes the OCS think the
+                    # balance is exhausted and return a final (TERMINATE) grant even
+                    # when balance remains — the bug this guards against.
                     if rg_state.granted_total_volume > 0:
-                        available = rg_state.granted_total_volume - rg_state.used_total_volume
-                        actual_consumed = min(per_rg, available)
+                        thr = rg_state.triggers.volume_quota_threshold
+                        report_cap = (rg_state.granted_total_volume - thr) if thr > 0 else rg_state.granted_total_volume
+                        report_cap = max(1, report_cap)
+                        available = report_cap - rg_state.used_total_volume
+                        actual_consumed = max(0, min(per_rg, available))
                     else:
                         actual_consumed = per_rg
                     rg_state.used_total_volume += actual_consumed

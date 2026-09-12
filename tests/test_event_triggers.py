@@ -71,3 +71,71 @@ def test_scheduled_event_trigger_fires_update():
         f"expected RAT_CHANGE update, got {handler.update_triggers}"
     )
     assert handler.released is True
+
+
+class QuotaCapHandler:
+    """Grants a fixed quota with a threshold; records reported usage volumes."""
+    def __init__(self, granted, threshold):
+        self.granted = granted
+        self.threshold = threshold
+        self.reported_totals = []
+        self.released = False
+        self._ref = "capp1"
+
+    def _grant(self, rg):
+        return {"multipleUnitInformation": [{
+            "ratingGroup": rg, "resultCode": "SUCCESS",
+            "grantedUnit": {"totalVolume": self.granted},
+            "validityTime": 100000, "volumeQuotaThreshold": self.threshold,
+        }]}
+
+    async def create_session(self, rating_groups):
+        return True, 1.0, {**self._grant(rating_groups[0]), "triggers": []}
+
+    async def update_session(self, sequence, used_units):
+        for u in used_units:
+            for c in u.get("usedUnitContainer", []):
+                self.reported_totals.append(c.get("totalVolume", 0))
+        return True, 1.0, self._grant(u["ratingGroup"])
+
+    async def release_session(self, sequence, used_units):
+        for u in used_units:
+            for c in u.get("usedUnitContainer", []):
+                self.reported_totals.append(c.get("totalVolume", 0))
+        self.released = True
+        return True, 1.0, {}
+
+    def get_session_ref(self):
+        return self._ref
+
+
+def test_update_never_reports_full_grant():
+    """With a high speed the engine used to dump the entire grant in one update,
+    provoking a premature final grant. The threshold cap must keep per-update
+    reported usage <= (granted - threshold)."""
+    granted, threshold = 10_485_760, 1_048_576  # matches the real trace
+    async def _run():
+        engine = ConsumptionEngine()
+        handler = QuotaCapHandler(granted, threshold)
+        await engine.start(
+            protocol=handler,
+            speed_mbps=1000.0,  # very fast — would blow through grant in one tick
+            num_sessions=1,
+            rating_groups=[1000],
+            session_duration_sec=2,
+        )
+        await asyncio.sleep(3)
+        await engine.stop()
+        return handler
+
+    handler = asyncio.run(_run())
+    cap = granted - threshold
+    # No UPDATE should report the full grant; release may add remaining usage but
+    # each individual container report must respect the per-cycle cap.
+    over = [t for t in handler.reported_totals if t > granted]
+    assert not over, f"reported more than granted: {handler.reported_totals}"
+    # At least one update happened and the first update did NOT report full grant.
+    assert handler.reported_totals, "no usage reported"
+    assert handler.reported_totals[0] <= cap, (
+        f"first update reported {handler.reported_totals[0]} > cap {cap}"
+    )
