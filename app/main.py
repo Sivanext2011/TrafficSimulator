@@ -2266,6 +2266,78 @@ async def get_en28_notifications():
     return {"notifications": en28_notifications}
 
 
+# ─── SLC (Nchf_SpendingLimitControl) first-class flow (feature #13) ────────────
+class SlcSubscribe(BaseModel):
+    fqdn: str
+    port: int = 80
+    base_path: str = "/nchf-spendinglimitcontrol/v1"
+    secure: bool = False
+    verify_ssl: bool = False
+    supi: str = "imsi-466010000000001"
+    gpsi: str = "msisdn-886912345678"
+    notif_uri: Optional[str] = None
+    policy_counter_ids: List[str] = []
+    initial_retrieval: bool = True
+    enable_en28: bool = False
+
+
+@app.post("/api/slc/subscribe")
+async def slc_subscribe(cfg: SlcSubscribe):
+    """SLC subscribe: POST /nchf-spendinglimitcontrol/v1/subscriptions. Stores
+    the subscription so it can be unsubscribed later. Notifications arrive at
+    /notifications/spendinglimit (view via GET /api/en28/notifications)."""
+    global en28_spending_limit_client
+    fqdn = cfg.fqdn.strip()
+    for pre in ("http://", "https://"):
+        if fqdn.startswith(pre):
+            fqdn = fqdn[len(pre):]
+    fqdn = fqdn.rstrip("/")
+
+    client = SpendingLimitClient(
+        fqdn=fqdn, port=cfg.port, base_path=cfg.base_path,
+        secure=cfg.secure, verify_ssl=cfg.verify_ssl,
+    )
+    notif_uri = cfg.notif_uri or "http://127.0.0.1:8080/notifications/spendinglimit"
+    success, latency_ms, resp = await client.subscribe(
+        supi=cfg.supi, gpsi=cfg.gpsi, notif_uri=notif_uri,
+        policy_counter_ids=cfg.policy_counter_ids,
+        initial_retrieval=cfg.initial_retrieval, enable_en28=cfg.enable_en28,
+    )
+    if success:
+        en28_spending_limit_client = client
+    return {
+        "success": success,
+        "latency_ms": round(latency_ms, 2),
+        "subscription_id": client.subscription_id,
+        "response": resp or {},
+    }
+
+
+@app.post("/api/slc/unsubscribe")
+async def slc_unsubscribe():
+    """SLC unsubscribe: DELETE the stored subscription."""
+    global en28_spending_limit_client
+    if not en28_spending_limit_client or not en28_spending_limit_client.is_subscribed:
+        return {"success": False, "error": "no active SLC subscription"}
+    success, latency_ms = await en28_spending_limit_client.unsubscribe()
+    try:
+        await en28_spending_limit_client.close()
+    except Exception:
+        pass
+    return {"success": success, "latency_ms": round(latency_ms, 2)}
+
+
+@app.get("/api/slc/status")
+async def slc_status():
+    """Current SLC subscription status + received notification count."""
+    c = en28_spending_limit_client
+    return {
+        "subscribed": bool(c and c.is_subscribed),
+        "subscription_id": c.subscription_id if c else None,
+        "notifications_received": len(en28_notifications),
+    }
+
+
 @app.delete("/api/en28/notifications")
 async def clear_en28_notifications():
     """Clear all stored eN28 notifications."""

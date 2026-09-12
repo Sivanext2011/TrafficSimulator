@@ -889,8 +889,13 @@
             <div class="card notification-panel" id="notificationPanel">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.8rem;">
                     <h3 style="margin-bottom:0;">eN28 Notifications</h3>
-                    <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="clearNotifications()">Clear</button>
+                    <div>
+                        <button class="btn" style="background:var(--bg-card);color:var(--accent);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="slcSubscribe()">SLC Subscribe</button>
+                        <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="slcUnsubscribe()">Unsubscribe</button>
+                        <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="clearNotifications()">Clear</button>
+                    </div>
                 </div>
+                <div id="slcStatus" style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:0.5rem;"></div>
                 <div id="notificationEntries">
                     <div style="color:var(--text-secondary);font-size:0.8rem;text-align:center;padding:1rem;">
                         Waiting for spending limit notifications from CHF...
@@ -1062,6 +1067,44 @@
                 document.getElementById('chfDiagTimeline').innerHTML = rows || 'no cases';
                 refreshChfDiag();
             } catch (e) { document.getElementById('chfDiagTimeline').innerHTML = 'Request failed: ' + e; }
+        }
+
+        // ─── SLC (SpendingLimitControl) first-class controls (feature #13) ────────
+        async function slcSubscribe() {
+            const fqdn = (document.getElementById('fqdn')||{}).value || '';
+            if (!fqdn) { alert('Set the Endpoint FQDN first.'); return; }
+            const body = {
+                fqdn: fqdn,
+                port: parseInt((document.getElementById('port')||{}).value) || 80,
+                secure: (document.getElementById('secure')||{}).checked || false,
+                base_path: '/nchf-spendinglimitcontrol/v1',
+                supi: 'imsi-' + ((document.getElementById('imsi')||{}).value || '466010000000001'),
+                gpsi: 'msisdn-' + ((document.getElementById('msisdn')||{}).value || '886912345678'),
+                enable_en28: true
+            };
+            try {
+                const r = await fetch('/api/slc/subscribe', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+                const d = await r.json();
+                document.getElementById('slcStatus').textContent = d.success
+                    ? `Subscribed: ${d.subscription_id} (${d.latency_ms}ms)`
+                    : `Subscribe failed: ${JSON.stringify(d.response||d.error||{})}`;
+                slcRefreshStatus();
+            } catch (e) { document.getElementById('slcStatus').textContent = 'Subscribe error: ' + e; }
+        }
+        async function slcUnsubscribe() {
+            try {
+                const r = await fetch('/api/slc/unsubscribe', { method:'POST' });
+                const d = await r.json();
+                document.getElementById('slcStatus').textContent = d.success ? 'Unsubscribed.' : ('Unsubscribe: ' + (d.error||'failed'));
+                slcRefreshStatus();
+            } catch (e) { document.getElementById('slcStatus').textContent = 'Unsubscribe error: ' + e; }
+        }
+        async function slcRefreshStatus() {
+            try {
+                const r = await fetch('/api/slc/status'); const d = await r.json();
+                if (d.subscribed) document.getElementById('slcStatus').textContent =
+                    `Subscribed: ${d.subscription_id} — ${d.notifications_received} notification(s)`;
+            } catch (e) { /* ignore */ }
         }
 
         let tpsData = [];
