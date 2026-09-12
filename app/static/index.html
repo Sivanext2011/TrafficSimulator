@@ -619,6 +619,30 @@
                             <input type="text" id="imsi" placeholder="310260000000001">
                         </div>
                     </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Identifier Type (charging key)</label>
+                            <select id="idType" onchange="onIdTypeChange()">
+                                <option value="imsi">IMSI (SUPI) — default</option>
+                                <option value="msisdn">MSISDN only (GPSI, no SUPI)</option>
+                                <option value="nai">NAI (SUPI)</option>
+                                <option value="extid">External ID (GPSI, IoT)</option>
+                                <option value="gci">GCI (wireline)</option>
+                                <option value="gli">GLI (wireline)</option>
+                            </select>
+                        </div>
+                        <div class="form-group" id="grpIdValue">
+                            <label id="idValueLabel">NAI / External ID / GCI / GLI value</label>
+                            <input type="text" id="idValue" placeholder="depends on identifier type">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>PEI (optional)</label>
+                            <input type="text" id="pei" placeholder="imeisv-3525566012011313">
+                        </div>
+                        <div class="form-group"></div>
+                    </div>
                     <div class="form-row-3">
                         <div class="form-group">
                             <label>Slice SST</label>
@@ -800,6 +824,23 @@
                 </div>
             </div>
 
+            <!-- CHF SBI Diagnostics (features #7 taxonomy, #8 timeline, #9 affinity, #10 matrix) -->
+            <div class="card" id="chfDiagPanel">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.8rem;">
+                    <h3 style="margin-bottom:0;">CHF Diagnostics</h3>
+                    <div>
+                        <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="runIdTranslationTest()">ID Translation Test</button>
+                        <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="refreshChfDiag()">Refresh</button>
+                        <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="resetChfDiag()">Reset</button>
+                    </div>
+                </div>
+                <div style="font-size:0.8rem;color:var(--text-secondary);margin-bottom:0.4rem;">Status codes & error causes</div>
+                <div id="chfDiagTaxonomy" style="font-size:0.85rem;margin-bottom:0.6rem;">—</div>
+                <div id="chfDiagAffinity" style="font-size:0.82rem;color:#e0a030;margin-bottom:0.6rem;"></div>
+                <div style="font-size:0.8rem;color:var(--text-secondary);margin-bottom:0.4rem;">Recent lifecycle</div>
+                <div id="chfDiagTimeline" style="font-size:0.78rem;font-family:monospace;max-height:180px;overflow:auto;">—</div>
+            </div>
+
             <!-- eN28 Notification Panel -->
             <div class="card notification-panel" id="notificationPanel">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.8rem;">
@@ -840,9 +881,100 @@
     <script>
         // ─── State ───────────────────────────────────────────────────────────────
         let selectedProtocol = 'chf';
+
+        // ─── Subscriber identifier selection ──────────────────────────────────────
+        // Relabel the free-text value field based on the chosen identifier type.
+        function onIdTypeChange() {
+            const t = (document.getElementById('idType') || {}).value || 'imsi';
+            const label = document.getElementById('idValueLabel');
+            const input = document.getElementById('idValue');
+            const grp = document.getElementById('grpIdValue');
+            const map = {
+                imsi:   { show: false, label: '', ph: '' },
+                msisdn: { show: false, label: '', ph: '' },
+                nai:    { show: true,  label: 'NAI value',          ph: 'user@realm' },
+                extid:  { show: true,  label: 'External ID (GPSI)', ph: 'device1@iot.operator.com' },
+                gci:    { show: true,  label: 'GCI value',          ph: '0011223344556677' },
+                gli:    { show: true,  label: 'GLI value',          ph: 'bng-volth-1/1/0/36' },
+            };
+            const cfg = map[t] || map.imsi;
+            if (grp) grp.style.display = cfg.show ? '' : 'none';
+            if (label) label.textContent = cfg.label;
+            if (input) input.placeholder = cfg.ph;
+        }
+
+        // Build the identifier-related subscriber fields sent to the backend.
+        function buildIdentityFields() {
+            const t = (document.getElementById('idType') || {}).value || 'imsi';
+            const v = (document.getElementById('idValue') || {}).value || '';
+            const pei = (document.getElementById('pei') || {}).value || '';
+            const out = { id_type: t };
+            if (t === 'nai')   out.nai = v || 'user@realm';
+            if (t === 'extid') out.ext_id = v || 'device1@iot.operator.com';
+            if (t === 'gci')   out.gci = v || '0011223344556677';
+            if (t === 'gli')   out.gli = v || 'bng-volth-1/1/0/36';
+            if (pei) out.pei = pei;
+            return out;
+        }
+
         let ws = null;
         let tpsChart = null;
         let responseChart = null;
+
+        // ─── CHF diagnostics UI (features #7/#8/#9/#10) ───────────────────────────
+        async function refreshChfDiag() {
+            try {
+                const r = await fetch('/api/chf/diagnostics');
+                const d = await r.json();
+                const codes = Object.entries(d.status_codes || {}).map(([k,v]) => `${k}:${v}`).join('  ') || 'none';
+                const causes = Object.entries(d.error_causes || {}).map(([k,v]) => `${k}:${v}`).join(', ') || 'none';
+                document.getElementById('chfDiagTaxonomy').innerHTML =
+                    `<b>HTTP:</b> ${codes}<br><b>Causes:</b> ${causes}`;
+                const warns = d.affinity_warnings || [];
+                document.getElementById('chfDiagAffinity').innerHTML = warns.length
+                    ? `⚠ ${warns.length} instance-affinity warning(s). Latest: ${warns[warns.length-1].message}`
+                    : '';
+                const tl = (d.timeline || []).slice(-15).reverse().map(e =>
+                    `${e.ts.substr(11,8)} ${e.op.padEnd(7)} ${e.status||'-'} ${(e.cause||'')} ${e.latency_ms}ms srv=${e.server||'-'}`
+                ).join('<br>') || '—';
+                document.getElementById('chfDiagTimeline').innerHTML = tl;
+            } catch (e) { /* ignore */ }
+        }
+        async function resetChfDiag() {
+            await fetch('/api/chf/diagnostics/reset', { method: 'POST' });
+            refreshChfDiag();
+        }
+        async function runIdTranslationTest() {
+            const fqdn = document.getElementById('fqdn') ? document.getElementById('fqdn').value : '';
+            const validImsi = document.getElementById('imsi').value || '';
+            const validMsisdn = document.getElementById('msisdn').value || '';
+            if (!fqdn || !validMsisdn) { alert('Set FQDN, IMSI and MSISDN first (Endpoint + Subscriber).'); return; }
+            const body = {
+                fqdn: fqdn,
+                port: parseInt((document.getElementById('port')||{}).value) || 80,
+                secure: false,
+                base_path: (document.getElementById('basePath')||{}).value || '/nchf-convergedcharging/v3',
+                valid_imsi: validImsi,
+                invalid_imsi: '999999999999999',
+                valid_msisdn: validMsisdn,
+                invalid_msisdn: '999999999999',
+                rating_groups: [1000]
+            };
+            document.getElementById('chfDiagTimeline').innerHTML = 'Running ID translation matrix...';
+            try {
+                const r = await fetch('/api/chf/id-translation-test', {
+                    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+                });
+                const d = await r.json();
+                if (d.error) { document.getElementById('chfDiagTimeline').innerHTML = 'Error: ' + d.error; return; }
+                const rows = (d.results||[]).map(x =>
+                    `<b>${x.case}</b>: status=${x.status||'timeout/none'} ${x.cause||''} → ${x.interpretation}`
+                ).join('<br>');
+                document.getElementById('chfDiagTimeline').innerHTML = rows || 'no cases';
+                refreshChfDiag();
+            } catch (e) { document.getElementById('chfDiagTimeline').innerHTML = 'Request failed: ' + e; }
+        }
+
         let tpsData = [];
         let latencyData = [];
         let timeLabels = [];
@@ -892,7 +1024,8 @@
                 isFullSession = (selectedProtocol === 'full_session');
                 toggleDiameterFields();
                 toggleFullSessionFields();
-                loadSavedSettings(); // Load per-protocol saved settings
+                loadSavedSettings();
+            onIdTypeChange(); // Load per-protocol saved settings
                 updateDefaultsForProtocol();
             }
         });
@@ -1058,6 +1191,7 @@
                     }
                     // Reload current protocol settings
                     loadSavedSettings();
+            onIdTypeChange();
                     addLog('SYS', 'Config', 'ok', 'Settings imported');
                 } catch (err) {
                     addLog('SYS', 'Config', 'error', 'Invalid config file');
@@ -1153,6 +1287,7 @@
                 subscriber: {
                     msisdn: document.getElementById('msisdn').value || '886912345678',
                     imsi: document.getElementById('imsi').value || '466010000000001',
+                    ...buildIdentityFields(),
                     rating_group: ratingGroups[0] || 1000,
                     slice_sst: parseInt(document.getElementById('sliceSST').value) || 1,
                     slice_sd: document.getElementById('sliceSD').value || '000001',
@@ -1219,6 +1354,7 @@
                 subscriber: {
                     msisdn: document.getElementById('msisdn').value || '886912345678',
                     imsi: document.getElementById('imsi').value || '466010000000001',
+                    ...buildIdentityFields(),
                     rating_group: ratingGroups[0] || 1000,
                     slice_sst: parseInt(document.getElementById('sliceSST').value) || 1,
                     slice_sd: document.getElementById('sliceSD').value || '000001',
@@ -1598,6 +1734,7 @@
                 subscriber: {
                     msisdn: document.getElementById('msisdn').value || '886912345678',
                     imsi: document.getElementById('imsi').value || '466010000000001',
+                    ...buildIdentityFields(),
                     rating_group: ratingGroups[0] || 1000,
                     slice_sst: parseInt(document.getElementById('sliceSST').value) || 1,
                     slice_sd: document.getElementById('sliceSD').value || '000001',
@@ -2048,9 +2185,12 @@
                 }
             }
             loadSavedSettings();
+            onIdTypeChange();
             initCharts();
             toggleDiameterFields();
             toggleFullSessionFields();
+            refreshChfDiag();
+            setInterval(refreshChfDiag, 5000);
             updateDefaultsForProtocol();
         });
     </script>

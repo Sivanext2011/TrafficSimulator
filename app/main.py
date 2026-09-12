@@ -108,6 +108,55 @@ CERT_DIR.mkdir(parents=True, exist_ok=True)
 consumption_engine = ConsumptionEngine()
 connected_clients: List[WebSocket] = []
 
+
+# ─── CHF SBI diagnostics (features #7 error taxonomy, #8 timeline, #9 affinity) ──
+class ChfDiagnostics:
+    """Collects CHF SBI diagnostics across sessions:
+    - error_causes: counter of ProblemDetails 'cause' / status for non-2xx
+    - status_codes: counter of HTTP status codes
+    - timeline: recent per-request lifecycle events (create/update/release)
+    - affinity: warnings when the CHF 'server' header differs within one session
+    """
+    def __init__(self, max_events: int = 500):
+        self.error_causes: Dict[str, int] = {}
+        self.status_codes: Dict[str, int] = {}
+        self.timeline: List[dict] = []
+        self.affinity_warnings: List[dict] = []
+        self._max = max_events
+
+    def record(self, event: dict):
+        code = str(event.get("status", ""))
+        if code:
+            self.status_codes[code] = self.status_codes.get(code, 0) + 1
+        cause = event.get("cause")
+        if cause:
+            self.error_causes[cause] = self.error_causes.get(cause, 0) + 1
+        self.timeline.append(event)
+        if len(self.timeline) > self._max:
+            self.timeline = self.timeline[-self._max:]
+
+    def record_affinity(self, warning: dict):
+        self.affinity_warnings.append(warning)
+        if len(self.affinity_warnings) > self._max:
+            self.affinity_warnings = self.affinity_warnings[-self._max:]
+
+    def get_status(self) -> dict:
+        return {
+            "status_codes": dict(self.status_codes),
+            "error_causes": dict(self.error_causes),
+            "affinity_warnings": self.affinity_warnings[-50:],
+            "timeline": self.timeline[-100:],
+        }
+
+    def reset(self):
+        self.error_causes.clear()
+        self.status_codes.clear()
+        self.timeline.clear()
+        self.affinity_warnings.clear()
+
+
+CHF_DIAG = ChfDiagnostics()
+
 # eN28 notification storage
 en28_notifications: List[dict] = []
 en28_spending_limit_client: Optional[SpendingLimitClient] = None
@@ -203,6 +252,7 @@ class ChfSessionHandler:
         self._charging_data_ref: Optional[str] = None
         self._charging_id: int = 0
         self._client: Optional[httpx.AsyncClient] = None
+        self._create_server: Optional[str] = None  # CHF 'server' header on create (affinity)
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -223,6 +273,47 @@ class ChfSessionHandler:
                     timeout=httpx.Timeout(30.0, connect=10.0),
                 )
         return self._client
+
+    def _resolve_identity(self):
+        """Resolve (subscriberIdentifier, servedGPSI) from the subscriber config.
+
+        Driven by sub['id_type']; explicit sub['supi']/sub['gpsi'] override.
+        Returns a tuple (subscriber_identifier, served_gpsi) where either may be
+        None (e.g. msisdn-only or extid-only cases send no subscriberIdentifier
+        unless a supi override is provided).
+        """
+        sub = self.subscriber
+        id_type = (sub.get("id_type") or "imsi").lower()
+
+        imsi = sub.get("imsi", "001010000000001")
+        msisdn = sub.get("msisdn", "12125551234")
+
+        # Default GPSI is the MSISDN unless an explicit gpsi/ext_id says otherwise.
+        gpsi = sub.get("gpsi")
+        if not gpsi:
+            if id_type == "extid" and sub.get("ext_id"):
+                gpsi = f"extid-{sub['ext_id']}"
+            else:
+                gpsi = f"msisdn-{msisdn}"
+
+        # Explicit supi override wins.
+        supi = sub.get("supi")
+        if not supi:
+            if id_type == "imsi":
+                supi = f"imsi-{imsi}"
+            elif id_type == "nai":
+                supi = f"nai-{sub.get('nai', 'user@realm')}"
+            elif id_type == "gci":
+                supi = f"gci-{sub.get('gci', '0011223344556677')}"
+            elif id_type == "gli":
+                supi = f"gli-{sub.get('gli', 'bng-line-0001')}"
+            elif id_type in ("msisdn", "extid"):
+                # GPSI-only lookup: no subscriberIdentifier by default.
+                supi = None
+            else:
+                supi = f"imsi-{imsi}"
+
+        return supi, gpsi
 
     def _build_create_payload(self, rating_groups: List[int]) -> dict:
         sub = self.subscriber
@@ -248,9 +339,9 @@ class ChfSessionHandler:
             "priorityLevel": int(sub.get("arp_priority", 12)),
         }
         qos_5qi = int(sub.get("5qi", 9))
+        supi, gpsi = self._resolve_identity()
 
-        return {
-            "subscriberIdentifier": sub.get("supi", f"imsi-{sub.get('imsi', '001010000000001')}"),
+        payload = {
             "nfConsumerIdentification": {
                 "nFName": sub.get("nf_name", "423e4567-e89b-12d3-a456-426655440001"),
                 "nFIPv4Address": sub.get("nf_ip", "192.168.0.1"),
@@ -350,19 +441,23 @@ class ChfSessionHandler:
                 },
                 "uetimeZone": sub.get("timezone", "+08:00"),
                 "userInformation": {
-                    "servedGPSI": sub.get("gpsi", f"msisdn-{sub.get('msisdn', '12125551234')}"),
+                    "servedGPSI": gpsi,
                     # Real SMF sends IMEISV, not IMEI
-                    "servedPEI": sub.get("pei", "imeisv-3525566012011313"),
+                    "servedPEI": sub.get("pei") or "imeisv-3525566012011313",
                     "unauthenticatedFlag": False,
                 },
             },
         }
+        if supi:
+            payload["subscriberIdentifier"] = supi
+        return payload
 
     def _build_update_payload(self, sequence: int, used_units: List[dict]) -> dict:
         sub = self.subscriber
         mcc = sub.get("mcc", "466")
         mnc = sub.get("mnc", "01")
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        supi, gpsi = self._resolve_identity()
 
         mscc_list = []
         for u in used_units:
@@ -396,7 +491,7 @@ class ChfSessionHandler:
                 "uPFID": sub.get("upf_id", "123e4567-e89b-12d3-a456-426655440001"),
             })
 
-        return {
+        payload = {
             "invocationSequenceNumber": sequence,
             "invocationTimeStamp": timestamp,
             "multipleUnitUsage": mscc_list,
@@ -427,19 +522,22 @@ class ChfSessionHandler:
                 },
                 "uetimeZone": sub.get("timezone", "+08:00"),
                 "userInformation": {
-                    "servedGPSI": sub.get("gpsi", f"msisdn-{sub.get('msisdn', '12125551234')}"),
-                    "servedPEI": sub.get("pei", "imeisv-3525566012011313"),
+                    "servedGPSI": gpsi,
+                    "servedPEI": sub.get("pei") or "imeisv-3525566012011313",
                     "unauthenticatedFlag": False,
                 },
             },
-            "subscriberIdentifier": sub.get("supi", f"imsi-{sub.get('imsi', '001010000000001')}"),
         }
+        if supi:
+            payload["subscriberIdentifier"] = supi
+        return payload
 
     def _build_release_payload(self, sequence: int, used_units: List[dict]) -> dict:
         sub = self.subscriber
         mcc = sub.get("mcc", "466")
         mnc = sub.get("mnc", "01")
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        supi, gpsi = self._resolve_identity()
 
         mscc_list = []
         for u in used_units:
@@ -471,7 +569,7 @@ class ChfSessionHandler:
                 "uPFID": sub.get("upf_id", "123e4567-e89b-12d3-a456-426655440001"),
             })
 
-        return {
+        payload = {
             "invocationSequenceNumber": sequence,
             "invocationTimeStamp": timestamp,
             "multipleUnitUsage": mscc_list,
@@ -505,13 +603,66 @@ class ChfSessionHandler:
                 },
                 "uetimeZone": sub.get("timezone", "+08:00"),
                 "userInformation": {
-                    "servedGPSI": sub.get("gpsi", f"msisdn-{sub.get('msisdn', '12125551234')}"),
-                    "servedPEI": sub.get("pei", "imeisv-3525566012011313"),
+                    "servedGPSI": gpsi,
+                    "servedPEI": sub.get("pei") or "imeisv-3525566012011313",
                     "unauthenticatedFlag": False,
                 },
             },
-            "subscriberIdentifier": sub.get("supi", f"imsi-{sub.get('imsi', '001010000000001')}"),
         }
+        if supi:
+            payload["subscriberIdentifier"] = supi
+        return payload
+
+    def _record_diag(self, op: str, response, latency_ms: float):
+        """Record CHF SBI diagnostics from a response: status code, error cause
+        (ProblemDetails), server-header instance affinity, and a timeline entry.
+        Safe to call for both success and error responses."""
+        try:
+            status = response.status_code
+            server = response.headers.get("server", "")
+            cause = None
+            detail = None
+            if status >= 400:
+                try:
+                    body = response.json()
+                    cause = body.get("cause")
+                    detail = body.get("detail")
+                except Exception:
+                    cause = f"HTTP_{status}"
+            event = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+                "op": op,
+                "status": status,
+                "cause": cause,
+                "detail": detail,
+                "server": server,
+                "charging_data_ref": self._charging_data_ref,
+                "charging_id": self._charging_id,
+                "latency_ms": round(latency_ms, 2),
+            }
+            CHF_DIAG.record(event)
+
+            # Instance-affinity detection: remember the server header at create,
+            # then flag if a later op is answered by a different CHF instance.
+            if op == "CREATE":
+                self._create_server = server or None
+            elif self._create_server and server and server != self._create_server:
+                warn = {
+                    "ts": event["ts"],
+                    "op": op,
+                    "charging_data_ref": self._charging_data_ref,
+                    "create_server": self._create_server,
+                    "this_server": server,
+                    "message": (
+                        f"{op} answered by a DIFFERENT CHF instance than CREATE "
+                        f"('{server}' vs '{self._create_server}') — likely load-balancer "
+                        f"instance-affinity issue; can cause RESOURCE_URI_STRUCTURE_NOT_FOUND."
+                    ),
+                }
+                CHF_DIAG.record_affinity(warn)
+                logger.warning(warn["message"])
+        except Exception as e:
+            logger.debug(f"diag record error: {e}")
 
     async def create_session(self, rating_groups: List[int]):
         """Create a CHF session. Returns (success, latency_ms, response_dict)."""
@@ -530,6 +681,7 @@ class ChfSessionHandler:
             logger.info(f"<<< CHF CREATE RESPONSE: status={response.status_code}, latency={latency_ms:.1f}ms")
             logger.info(f"<<< HEADERS: {dict(response.headers)}")
             logger.info(f"<<< BODY: {response.text[:1000]}")
+            self._record_diag("CREATE", response, latency_ms)
 
             if response.status_code in (200, 201):
                 location = response.headers.get("location", "")
@@ -570,6 +722,7 @@ class ChfSessionHandler:
 
             logger.info(f"<<< CHF UPDATE RESPONSE: status={response.status_code}, latency={latency_ms:.1f}ms")
             logger.info(f"<<< BODY: {response.text[:1000]}")
+            self._record_diag("UPDATE", response, latency_ms)
 
             if response.status_code == 200:
                 response_data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
@@ -603,6 +756,7 @@ class ChfSessionHandler:
 
             logger.info(f"<<< CHF RELEASE RESPONSE: status={response.status_code}, latency={latency_ms:.1f}ms")
             logger.info(f"<<< BODY: {response.text[:500]}")
+            self._record_diag("RELEASE", response, latency_ms)
 
             if response.status_code in (200, 204):
                 return True, latency_ms, {}
@@ -897,6 +1051,22 @@ class EndpointConfig(BaseModel):
 class SubscriberConfig(BaseModel):
     msisdn: str = "886912345678"
     imsi: str = "466010000000001"
+    # Subscriber identifier selection. `id_type` chooses which identity is used
+    # as the CHF subscriberIdentifier (supi) and, where applicable, servedGPSI.
+    #   imsi   -> subscriberIdentifier=imsi-<imsi>,  servedGPSI=msisdn-<msisdn>
+    #   msisdn -> subscriberIdentifier omitted where allowed; servedGPSI=msisdn-<msisdn>
+    #   nai    -> subscriberIdentifier=nai-<nai>
+    #   extid  -> servedGPSI=extid-<ext_id>
+    #   gci    -> subscriberIdentifier=gci-<gci>
+    #   gli    -> subscriberIdentifier=gli-<gli>
+    id_type: str = "imsi"          # imsi | msisdn | nai | extid | gci | gli
+    supi: Optional[str] = None     # explicit override, e.g. "imsi-4660100..."
+    gpsi: Optional[str] = None     # explicit override, e.g. "msisdn-8869..."
+    pei: Optional[str] = None      # e.g. "imeisv-3525566012011313"
+    nai: Optional[str] = None      # e.g. "user@realm"
+    ext_id: Optional[str] = None   # External Identifier, e.g. "device1@iot.op.com"
+    gci: Optional[str] = None      # Global Cable Identifier
+    gli: Optional[str] = None      # Global Line Identifier
     rating_group: int = 1
     slice_sst: int = 1
     slice_sd: str = "000001"
@@ -1268,6 +1438,109 @@ async def set_log_level(request: Request):
     return {"status": "ok", "level": level_name}
 
 
+# ─── CHF SBI diagnostics (features #7 taxonomy, #8 timeline, #9 affinity) ──────
+@app.get("/api/chf/diagnostics")
+async def get_chf_diagnostics():
+    """CHF SBI diagnostics: HTTP status-code counts, ProblemDetails error-cause
+    taxonomy (USER_UNKNOWN, RESOURCE_URI_STRUCTURE_NOT_FOUND, MANDATORY_IE_MISSING,
+    ...), load-balancer instance-affinity warnings, and a recent request timeline."""
+    return CHF_DIAG.get_status()
+
+
+@app.post("/api/chf/diagnostics/reset")
+async def reset_chf_diagnostics():
+    CHF_DIAG.reset()
+    return {"status": "ok"}
+
+
+class IdTranslationTest(BaseModel):
+    """Config for the ID-translation test matrix (feature #10)."""
+    fqdn: str
+    port: int = 80
+    base_path: Optional[str] = None
+    secure: bool = False
+    verify_ssl: bool = False
+    # Identities to combine in the matrix
+    valid_imsi: Optional[str] = None      # e.g. "466924300000018"
+    invalid_imsi: Optional[str] = None    # e.g. "999999999999999"
+    valid_msisdn: Optional[str] = None    # e.g. "886988414918"
+    invalid_msisdn: Optional[str] = None  # e.g. "999999999999"
+    rating_groups: List[int] = [1000]
+
+
+@app.post("/api/chf/id-translation-test")
+async def chf_id_translation_test(cfg: IdTranslationTest):
+    """Run an ID-translation test matrix against a live CHF.
+
+    Sends CHF CREATE with deliberately mixed valid/invalid IMSI + MSISDN
+    combinations and reports, per case, whether the CHF accepted (201) or
+    rejected (e.g. 404 USER_UNKNOWN). This isolates which identifier the CHF's
+    ID Translation actually resolved on (e.g. after disabling IMSI to force
+    MSISDN). Interpretation is included per row.
+    """
+    fqdn = cfg.fqdn.strip()
+    for pre in ("http://", "https://"):
+        if fqdn.startswith(pre):
+            fqdn = fqdn[len(pre):]
+    fqdn = fqdn.rstrip("/")
+    base_path = cfg.base_path or "/nchf-convergedcharging/v3"
+
+    # Build the matrix of (label, supi, gpsi, expectation-hint)
+    cases = []
+    def add(label, imsi, msisdn, hint):
+        sub = {"id_type": "imsi"}
+        if imsi is not None:
+            sub["supi"] = f"imsi-{imsi}"
+        else:
+            sub["id_type"] = "msisdn"  # no supi -> gpsi-only
+        if msisdn is not None:
+            sub["gpsi"] = f"msisdn-{msisdn}"
+        cases.append((label, sub, hint))
+
+    if cfg.valid_imsi and cfg.valid_msisdn:
+        add("valid IMSI + valid MSISDN", cfg.valid_imsi, cfg.valid_msisdn,
+            "baseline; should succeed regardless of key")
+    if cfg.invalid_imsi and cfg.valid_msisdn:
+        add("INVALID IMSI + valid MSISDN", cfg.invalid_imsi, cfg.valid_msisdn,
+            "201 => MSISDN was used for lookup (IMSI ignored/disabled); 404 => still keying on IMSI")
+    if cfg.valid_imsi and cfg.invalid_msisdn:
+        add("valid IMSI + INVALID MSISDN", cfg.valid_imsi, cfg.invalid_msisdn,
+            "201 => IMSI was used for lookup; 404 => keying on MSISDN")
+    if cfg.valid_msisdn:
+        add("MSISDN only (no SUPI)", None, cfg.valid_msisdn,
+            "201 => MSISDN-only lookup works; 400 MANDATORY_IE_MISSING => supi required by schema")
+    if not cases:
+        return {"error": "provide at least valid_msisdn plus one of valid_imsi/invalid_imsi/invalid_msisdn"}
+
+    results = []
+    for label, sub, hint in cases:
+        handler = ChfSessionHandler(
+            fqdn=fqdn, port=cfg.port, base_path=base_path,
+            cert_path=None, key_path=None, ca_path=None,
+            subscriber=sub, secure=cfg.secure, verify_ssl=cfg.verify_ssl,
+        )
+        success, latency_ms, resp = await handler.create_session(cfg.rating_groups)
+        # Pull the last diagnostics event for cause/status
+        last = CHF_DIAG.timeline[-1] if CHF_DIAG.timeline else {}
+        results.append({
+            "case": label,
+            "sent_subscriberIdentifier": sub.get("supi"),
+            "sent_servedGPSI": sub.get("gpsi"),
+            "success": success,
+            "status": last.get("status"),
+            "cause": last.get("cause"),
+            "detail": last.get("detail"),
+            "latency_ms": round(latency_ms, 2),
+            "interpretation": hint,
+        })
+        try:
+            await handler.close()
+        except Exception:
+            pass
+
+    return {"base_path": base_path, "fqdn": fqdn, "results": results}
+
+
 @app.post("/api/traffic/speed")
 async def update_speed(update: SpeedUpdate):
     """Update the simulated download speed in real time (slider changes)."""
@@ -1298,6 +1571,11 @@ async def get_metrics():
     m["latency_p99_ms"] = _pct(99)
     # Diameter result-code breakdown (from diagnostics)
     m["result_codes"] = DIAG.get_status().get("result_codes", {})
+    # CHF SBI status-code + error-cause taxonomy (feature #7)
+    _chf = CHF_DIAG.get_status()
+    m["chf_status_codes"] = _chf["status_codes"]
+    m["chf_error_causes"] = _chf["error_causes"]
+    m["chf_affinity_warnings"] = len(_chf["affinity_warnings"])
     return m
 
 
