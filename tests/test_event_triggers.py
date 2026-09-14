@@ -209,3 +209,81 @@ def test_final_grant_is_consumed_before_release():
     assert handler.total_reported >= final * 0.95, (
         f"final grant not consumed: reported {handler.total_reported} of {final}"
     )
+
+
+
+class ReleaseUsageHandler:
+    """Records the usage reported on the FINAL release specifically."""
+    def __init__(self, granted):
+        self.granted = granted
+        self.release_totals = []
+        self.released = False
+        self._ref = "relp1"
+
+    def _grant(self, rg):
+        return {"multipleUnitInformation": [{
+            "ratingGroup": rg, "resultCode": "SUCCESS",
+            "grantedUnit": {"totalVolume": self.granted},
+            # Huge validity + no threshold so nothing triggers during the window:
+            # the session stays on its FIRST grant and is ended only by stop().
+            "validityTime": 10 ** 9, "volumeQuotaThreshold": 0,
+        }]}
+
+    async def create_session(self, rating_groups):
+        return True, 1.0, {**self._grant(rating_groups[0]), "triggers": []}
+
+    async def update_session(self, sequence, used_units):
+        return True, 1.0, self._grant(used_units[0]["ratingGroup"])
+
+    async def release_session(self, sequence, used_units):
+        for u in used_units:
+            for c in u.get("usedUnitContainer", []):
+                self.release_totals.append(c.get("totalVolume", 0))
+        self.released = True
+        return True, 1.0, {}
+
+    def get_session_ref(self):
+        return self._ref
+
+
+def test_release_reports_truthful_bounded_usage_not_random_fraction():
+    """On stop, the CCR-T (release) must report the ACTUAL bytes used since the
+    last report (rate * elapsed), capped at the grant — NOT a random 10-50%
+    slice of the whole grant. With a 1 GB grant consumed at 1 Mbps over a few
+    seconds, the released usage must be tiny (well under 1% of the grant),
+    which the old random-fabrication code could never guarantee."""
+    granted = 1_000_000_000  # 1 GB grant
+    speed_mbps = 1.0         # 1 Mbps => 125 000 bytes/sec
+
+    async def _run():
+        engine = ConsumptionEngine()
+        handler = ReleaseUsageHandler(granted)
+        await engine.start(
+            protocol=handler,
+            speed_mbps=speed_mbps,
+            num_sessions=1,
+            rating_groups=[1000],
+            session_duration_sec=3,
+        )
+        await asyncio.sleep(3)
+        await engine.stop()
+        return handler
+
+    handler = asyncio.run(_run())
+    assert handler.released is True
+    assert handler.release_totals, "release reported no usage container"
+    released = handler.release_totals[0]
+
+    # Must never exceed the grant (3GPP correctness).
+    assert released <= granted, f"released {released} exceeds grant {granted}"
+
+    # Truthful bound: at 1 Mbps, even reporting ALL 3s of the run is ~375 KB.
+    # Give generous headroom (2s of accrual worst case since only the tail since
+    # the last report is unreported) but assert it is nowhere near the random
+    # 10-50% of grant (i.e. 100 MB - 500 MB) the old code produced.
+    bytes_per_sec = (speed_mbps * 1_000_000) / 8
+    upper_bound = int(bytes_per_sec * 5)  # 5s of usage — a comfortable ceiling
+    assert released <= upper_bound, (
+        f"released {released} bytes looks fabricated; expected <= {upper_bound} "
+        f"(rate-based). This is ~{released / granted:.1%} of the grant."
+    )

@@ -311,6 +311,52 @@ class ConsumptionEngine:
                 trigger_type = None
                 any_triggered = False
 
+                # Scheduled event triggers (feature #4) take PRIORITY over the
+                # automatic volume/quota triggers: a real mid-session network
+                # event (RAT_CHANGE, PLMN_CHANGE, ...) preempts a routine volume
+                # report. Checking these first prevents VOLUME_LIMIT — which can
+                # fire almost every tick — from starving the scheduled events.
+                if session.event_triggers:
+                    for idx, ev in enumerate(session.event_triggers):
+                        if idx in session.fired_event_indexes:
+                            continue
+                        if elapsed >= float(ev.get("at", 0)):
+                            ev_type = str(ev.get("type", "RAT_CHANGE"))
+                            session.fired_event_indexes.add(idx)
+                            # Special: "SUPPORTED_FEATURES=<hexval>" changes the
+                            # negotiated supportedFeatures the SMF sends. The CHF
+                            # re-arms triggers on an Update when this value changes
+                            # (per Nchf feature negotiation). We mutate the
+                            # protocol handler's subscriber so the next UPDATE
+                            # carries the new value, then send an immediate update.
+                            if ev_type.upper().startswith("SUPPORTED_FEATURES"):
+                                newval = ev_type.split("=", 1)[1].strip() if "=" in ev_type else "1"
+                                try:
+                                    if hasattr(protocol, "subscriber") and isinstance(protocol.subscriber, dict):
+                                        protocol.subscriber["supported_features"] = newval
+                                    logger.info(f"supportedFeatures changed to '{newval}' at {elapsed:.0f}s — forcing Update to re-arm triggers")
+                                except Exception as e:
+                                    logger.error(f"Failed to change supportedFeatures: {e}")
+                                trigger_type = "TIME_LIMIT"  # generic reporting reason for the forced update
+                                any_triggered = True
+                                break
+                            if ev_type.upper() in ("ROAMING_UPDATE", "IS_ROAMING_UPDATE"):
+                                # Set isRoamingUpdate=true on the next Update so the
+                                # CHF re-arms QBC triggers. One-shot by default.
+                                try:
+                                    if hasattr(protocol, "subscriber") and isinstance(protocol.subscriber, dict):
+                                        protocol.subscriber["is_roaming_update"] = True
+                                    logger.info(f"isRoamingUpdate set true at {elapsed:.0f}s — forcing Update to re-arm QBC triggers")
+                                except Exception as e:
+                                    logger.error(f"Failed to set isRoamingUpdate: {e}")
+                                trigger_type = "TIME_LIMIT"
+                                any_triggered = True
+                                break
+                            trigger_type = ev_type
+                            any_triggered = True
+                            logger.info(f"Event trigger fired at {elapsed:.0f}s: {trigger_type}")
+                            break
+
                 for rg_id, rg_state in session.rating_groups.items():
                     # Cap consumption so a single interval never reports the ENTIRE
                     # grant. Report at the quota-threshold point (granted - threshold)
@@ -356,19 +402,6 @@ class ConsumptionEngine:
                         trigger_type = "VOLUME_LIMIT"
                         any_triggered = True
 
-                # Check scheduled event triggers (feature #4): fire an UPDATE with
-                # the configured triggerType (e.g. RAT_CHANGE) once its time arrives.
-                if not any_triggered and session.event_triggers:
-                    for idx, ev in enumerate(session.event_triggers):
-                        if idx in session.fired_event_indexes:
-                            continue
-                        if elapsed >= float(ev.get("at", 0)):
-                            trigger_type = str(ev.get("type", "RAT_CHANGE"))
-                            any_triggered = True
-                            session.fired_event_indexes.add(idx)
-                            logger.info(f"Event trigger fired at {elapsed:.0f}s: {trigger_type}")
-                            break
-
                 # Update total consumption metric
                 total_consumed = sum(rg.cumulative_volume for rg in session.rating_groups.values())
                 self._metrics["total_volume_consumed_mb"] = total_consumed / (1024 * 1024)
@@ -392,8 +425,14 @@ class ConsumptionEngine:
                         await metrics_callback(self.get_metrics())
 
                     if success:
-                        # Parse new grants and triggers from response
+                        # Parse new grants from the response.
                         self._parse_grants(session, response_data)
+                        # Re-arm: the CHF MAY return an updated Triggers set in an
+                        # UPDATE response (TS 32.291, MultipleUnitInformation /
+                        # session-level Triggers, cardinality 0..N). Honor it live
+                        # so a re-armed/changed trigger set takes effect mid-session
+                        # instead of being ignored.
+                        self._parse_session_triggers(session, response_data)
 
                         # If all rating groups failed, stop consuming and release
                         if self._all_rating_groups_failed(session):
@@ -431,20 +470,38 @@ class ConsumptionEngine:
                     break
 
             # === RELEASE ===
-            # If used counters are zero (after last _reset_used), simulate final
-            # consumption of remaining granted quota that hasn't been reported yet.
+            # Report the ACTUAL unreported usage on the final CCR-T, not a random
+            # slice of the grant. There are two cases:
+            #   1. used_total_volume > 0: real consumption occurred since the last
+            #      UPDATE and was never reported — report exactly that.
+            #   2. used_total_volume == 0: a _reset_used() just ran (release right
+            #      after an UPDATE). Compute the genuine bytes used between the last
+            #      report and now = rate * elapsed_since_last_report.
+            # In both cases, cap at the remaining (unconsumed) grant — 3GPP forbids
+            # reporting more than was granted, and the leftover reservation is freed
+            # by the OCS on session termination (it is not billed).
+            bytes_per_second = (self._speed_mbps * 1_000_000) / 8  # Mbps -> bytes/sec
+            elapsed_since_report = max(0.0, time.time() - session.last_update_time)
+            n_rgs = len(session.rating_groups) or 1
             for rg_state in session.rating_groups.values():
                 if rg_state.used_total_volume == 0 and rg_state.granted_total_volume > 0:
-                    # Report remaining unreported usage (what was consumed since last update)
-                    # In reality, some data would have been used between last CCR-U and CCR-T
-                    # Cap at granted volume (3GPP: can't report more than granted)
-                    import random as _rnd
-                    final_usage = max(1, int(rg_state.granted_total_volume * _rnd.uniform(0.10, 0.50)))
-                    final_usage = min(final_usage, rg_state.granted_total_volume)
-                    rg_state.used_total_volume = final_usage
-                    rg_state.used_downlink = int(final_usage * 0.7)
-                    rg_state.used_uplink = final_usage - int(final_usage * 0.7)
-                    rg_state.cumulative_volume += final_usage
+                    # Genuine usage accrued since the last report, split across RGs.
+                    accrued = int((bytes_per_second * elapsed_since_report) / n_rgs)
+                    # Cap at the current grant (3GPP: never report more than granted
+                    # in the active grant window).
+                    final_usage = max(0, min(accrued, rg_state.granted_total_volume))
+                    if final_usage > 0:
+                        rg_state.used_total_volume = final_usage
+                        rg_state.used_downlink = int(final_usage * 0.7)
+                        rg_state.used_uplink = final_usage - int(final_usage * 0.7)
+                        rg_state.cumulative_volume += final_usage
+                else:
+                    # Case 1: real unreported usage exists; make sure it does not
+                    # exceed what was granted for this rating group.
+                    if rg_state.granted_total_volume > 0:
+                        rg_state.used_total_volume = min(
+                            rg_state.used_total_volume, rg_state.granted_total_volume
+                        )
 
             session.invocation_sequence += 1
             used_units = self._build_used_units(session, include_requested=False, trigger_type="FINAL")

@@ -444,12 +444,9 @@
         <h1>&#128225; Telecom Traffic Simulator</h1>
         <div class="protocol-tabs" id="protocolTabs">
             <button class="active" data-protocol="chf">CHF</button>
-            <button data-protocol="pcf">PCF</button>
             <button data-protocol="gy">Gy</button>
-            <button data-protocol="sy">Sy</button>
-            <button data-protocol="ro">Ro</button>
             <button data-protocol="scapv2">SCAPv2</button>
-            <button data-protocol="full_session" style="border-color: var(--warning); color: var(--warning);">Full Session</button>
+            <button data-protocol="ro">Ro</button>
         </div>
     </header>
 
@@ -469,12 +466,12 @@
             <div class="tab-content" id="tabIntegration">
                 <div class="card" id="endpointCard">
                     <h3>Endpoint</h3>
-                    <div class="form-group">
+                    <div class="form-group sbi-only">
                         <label>FQDN</label>
                         <input type="text" id="fqdn" placeholder="e.g. chf.example.com">
                         <small id="fqdnHint" style="color:var(--text-secondary);font-size:0.72rem;"></small>
                     </div>
-                    <div class="form-row">
+                    <div class="form-row sbi-only">
                         <div class="form-group">
                             <label>Port</label>
                             <input type="number" id="port" placeholder="443">
@@ -484,7 +481,7 @@
                             <input type="text" id="basePath" placeholder="/nchf-convergedcharging/v3">
                         </div>
                     </div>
-                    <div class="form-row">
+                    <div class="form-row sbi-only">
                         <div class="form-group">
                             <label>Nchf Version</label>
                             <select id="nchfVersion" onchange="onNchfVersionChange()">
@@ -495,7 +492,7 @@
                         </div>
                         <div class="form-group"></div>
                     </div>
-                    <div class="form-row">
+                    <div class="form-row sbi-only">
                         <div class="form-group">
                             <label><input type="checkbox" id="secure" checked> HTTPS (TLS)</label>
                         </div>
@@ -503,7 +500,7 @@
                             <label><input type="checkbox" id="verifySsl"> Verify SSL</label>
                         </div>
                     </div>
-                    <button class="btn" style="background:var(--bg-card);color:var(--accent);width:100%;margin-top:0.5rem;border:1px solid var(--accent);" onclick="testConnection()">&#128268; Test Connection</button>
+                    <button class="btn sbi-only" style="background:var(--bg-card);color:var(--accent);width:100%;margin-top:0.5rem;border:1px solid var(--accent);" onclick="testConnection()">&#128268; Test Connection</button>
                     <div id="connTestResult" style="display:none;margin-top:0.5rem;font-size:0.8rem;padding:0.4rem 0.7rem;border-radius:6px;"></div>
                 </div>
 
@@ -554,33 +551,92 @@
                     </div>
                 </div>
 
-                <!-- Full Session (eN28) fields -->
+                <!-- Companion Spending-Limit leg (CHF only) -->
                 <div class="card full-session-fields" id="fullSessionFields">
-                    <h3>eN28 Spending Limit Control</h3>
+                    <h3>Companion Session (optional)</h3>
+                    <small style="color:var(--text-secondary);font-size:0.72rem;display:block;margin-bottom:0.5rem;">
+                        Run a Spending-Limit leg alongside the CHF charging session
+                        (Subscribe → CHF → Unsubscribe). Available for CHF only.
+                    </small>
                     <div class="form-group">
-                        <label>eN28 Endpoint (leave blank = same as CHF)</label>
-                        <div class="form-row">
-                            <input type="text" id="en28Fqdn" placeholder="Same as CHF FQDN">
-                            <input type="number" id="en28Port" placeholder="Same as CHF port">
-                        </div>
+                        <label>Companion protocol</label>
+                        <select id="companion" onchange="onCompanionChange()">
+                            <option value="none" selected>None (CHF only)</option>
+                            <option value="n28">N28 — SBI SpendingLimitControl</option>
+                            <option value="en28">eN28 — Ericsson SLC extension</option>
+                            <option value="sy">Sy — Diameter Spending-Limit</option>
+                            <option value="esy">eSy — Ericsson Sy extension</option>
+                        </select>
                     </div>
-                    <div class="form-group">
-                        <label>eN28 Base Path</label>
-                        <input type="text" id="en28BasePath" value="/nchf-spendinglimitcontrol/v1">
-                    </div>
-                    <div class="form-group">
-                        <label>Notification Callback URI (reachable from CHF)</label>
-                        <input type="text" id="notifUri" placeholder="http://your-ip:8080/notifications/spendinglimit">
-                    </div>
-                    <div class="form-group">
+                    <div id="companionBanner" style="display:none;margin:0.3rem 0 0.6rem 0;padding:0.4rem 0.7rem;border-radius:6px;font-size:0.76rem;background:rgba(76,175,80,0.15);color:var(--success);"></div>
+
+                    <!-- Shared: policy counters -->
+                    <div class="form-group companion-common" style="display:none;">
                         <label>Policy Counter IDs (comma-separated)</label>
                         <input type="text" id="policyCounterIds" placeholder="counter01,counter02" value="1">
                     </div>
-                    <div class="form-group">
+                    <div class="form-group companion-common" style="display:none;">
                         <label><input type="checkbox" id="initialRetrieval" checked> Initial Spending Limit Retrieval</label>
                     </div>
-                    <div class="form-group">
-                        <label><input type="checkbox" id="enableEn28"> Enable E-N28 (ERICSSON_SLC) — Request Policy Groups via vendorSpecific-000193</label>
+
+                    <!-- N28 / eN28 fields -->
+                    <div class="companion-n28" style="display:none;">
+                        <div class="form-group">
+                            <label>eN28 Endpoint (leave blank = same as CHF)</label>
+                            <div class="form-row">
+                                <input type="text" id="en28Fqdn" placeholder="Same as CHF FQDN">
+                                <input type="number" id="en28Port" placeholder="Same as CHF port">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>eN28 Base Path</label>
+                            <input type="text" id="en28BasePath" value="/nchf-spendinglimitcontrol/v1">
+                        </div>
+                        <div class="form-group">
+                            <label>Notification Callback URI (reachable from CHF)</label>
+                            <input type="text" id="notifUri" placeholder="http://your-ip:8080/notifications/spendinglimit">
+                        </div>
+                        <!-- Hidden compatibility flag; set automatically from companion=en28 -->
+                        <input type="checkbox" id="enableEn28" style="display:none;">
+                    </div>
+
+                    <!-- Sy / eSy fields (real Diameter SLR over TCP/SCTP) -->
+                    <div class="companion-sy" style="display:none;">
+                        <div class="form-group">
+                            <label>Diameter Sy Peer Address (IP/FQDN + port to connect)</label>
+                            <div class="form-row">
+                                <input type="text" id="syFqdn" placeholder="e.g. dlb.ocs.example.com or 10.0.0.9">
+                                <input type="number" id="syPort" placeholder="3868" value="3868">
+                            </div>
+                            <small style="color:var(--text-secondary);font-size:0.72rem;">
+                                Real Diameter Sy: SLR (cmd 8388635) / SLA over TCP. App-Id 16777302
+                                (eSy uses Ericsson vendor 193). Set the P-bit for DLB relay. Leave
+                                address blank to reuse the CHF host; default port 3868.
+                            </small>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Origin-Host</label>
+                                <input type="text" id="syOriginHost" placeholder="sy-simulator.local">
+                            </div>
+                            <div class="form-group">
+                                <label>Origin-Realm</label>
+                                <input type="text" id="syOriginRealm" placeholder="simulator.local">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Destination-Host (optional)</label>
+                                <input type="text" id="syDestHost" placeholder="leave blank for realm routing">
+                            </div>
+                            <div class="form-group">
+                                <label>Destination-Realm</label>
+                                <input type="text" id="syDestRealm" placeholder="epc.mnc001.mcc001.3gppnetwork.org">
+                            </div>
+                        </div>
+                        <!-- Retained hidden for settings compatibility; unused for real Diameter -->
+                        <input type="text" id="syBasePath" style="display:none;">
+                        <input type="checkbox" id="sySecure" style="display:none;">
                     </div>
                 </div>
 
@@ -875,6 +931,7 @@
                     <div>
                         <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="runIdTranslationTest()">ID Translation Test</button>
                         <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="window.open('/api/chf/capture','_blank')">Export Capture</button>
+                        <button class="btn" style="background:var(--bg-card);color:var(--accent);font-size:0.72rem;padding:0.3rem 0.6rem;border:1px solid var(--accent);" onclick="window.open('/api/diameter/pcap','_blank')" title="Download captured Diameter (Gy/Ro/Sy/eSy) traffic as a Wireshark .pcap">&#11015; Diameter PCAP</button>
                         <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="refreshChfDiag()">Refresh</button>
                         <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.72rem;padding:0.3rem 0.6rem;" onclick="resetChfDiag()">Reset</button>
                     </div>
@@ -1116,8 +1173,8 @@
 
         // Speed steps for logarithmic-feel slider
         const speedSteps = [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
-        const diameterProtocols = ['gy', 'ro', 'sy'];
-        const sbiProtocols = ['chf', 'pcf', 'scapv2'];
+        const diameterProtocols = ['gy', 'ro'];
+        const sbiProtocols = ['chf', 'scapv2'];
 
         // ─── Integration field IDs and their localStorage keys ───────────────────
         // All persistable fields across both tabs
@@ -1127,9 +1184,13 @@
             // Diameter fields
             'diameterHost', 'diameterPort', 'originHost', 'originRealm',
             'destinationHost', 'destinationRealm', 'serviceContextId', 'authApplicationId',
-            // eN28 fields
+            // Companion selection + eN28 fields
+            'companion',
             'en28Fqdn', 'en28Port', 'en28BasePath', 'notifUri',
             'policyCounterIds', 'initialRetrieval', 'enableEn28',
+            // Sy companion fields
+            'syFqdn', 'syPort', 'syBasePath', 'sySecure',
+            'syOriginHost', 'syOriginRealm', 'syDestHost', 'syDestRealm',
             // Subscriber fields
             'msisdn', 'imsi', 'sliceSST', 'sliceSD', 'dnn', 'apn', 'mcc', 'mnc',
             // Traffic fields
@@ -1154,12 +1215,12 @@
                 document.querySelectorAll('.protocol-tabs button').forEach(b => b.classList.remove('active'));
                 e.target.classList.add('active');
                 selectedProtocol = e.target.dataset.protocol;
-                isFullSession = (selectedProtocol === 'full_session');
                 toggleDiameterFields();
                 toggleFullSessionFields();
                 loadSavedSettings();
             onIdTypeChange(); // Load per-protocol saved settings
                 updateDefaultsForProtocol();
+                onCompanionChange();
             }
         });
 
@@ -1168,12 +1229,9 @@
             const portEl = document.getElementById('port');
             const defaults = {
                 'chf': { path: '/nchf-convergedcharging/v2', port: '80' },
-                'pcf': { path: '/npcf-smpolicycontrol/v1', port: '80' },
                 'scapv2': { path: '/scapv2/charging/v1', port: '80' },
                 'gy': { path: '', port: '3868' },
                 'ro': { path: '', port: '3868' },
-                'sy': { path: '', port: '3868' },
-                'full_session': { path: '/nchf-convergedcharging/v2', port: '80' },
             };
             const d = defaults[selectedProtocol] || defaults['chf'];
             basePathEl.placeholder = d.path;
@@ -1183,37 +1241,104 @@
             if (!portEl.value || ['80', '443', '3868'].includes(portEl.value)) {
                 portEl.value = d.port;
             }
-            // Auto-fill notifUri with current host
-            if (isFullSession) {
+            // Auto-fill notifUri with current host when CHF is selected
+            if (selectedProtocol === 'chf') {
                 const notifUriEl = document.getElementById('notifUri');
-                if (!notifUriEl.value) {
+                if (notifUriEl && !notifUriEl.value) {
                     notifUriEl.value = `http://${window.location.hostname}:${window.location.port || '8080'}/notifications/spendinglimit`;
                 }
             }
         }
 
         function toggleFullSessionFields() {
-            const fullSessionSection = document.getElementById('fullSessionFields');
-            const notifPanel = document.getElementById('notificationPanel');
-            if (isFullSession) {
-                fullSessionSection.classList.add('visible');
-                notifPanel.classList.add('visible');
+            const companionCard = document.getElementById('fullSessionFields');
+            // Companion sessions are only meaningful for CHF.
+            const showCard = (selectedProtocol === 'chf');
+            if (showCard) {
+                companionCard.classList.add('visible');
             } else {
-                fullSessionSection.classList.remove('visible');
-                notifPanel.classList.remove('visible');
+                companionCard.classList.remove('visible');
+                // Reset companion selection when leaving CHF so we don't
+                // accidentally start a full session on a Diameter protocol.
+                const compEl = document.getElementById('companion');
+                if (compEl) compEl.value = 'none';
+            }
+            onCompanionChange();
+        }
+
+        // Show/hide companion sub-sections based on the selected companion
+        // and derive isFullSession from the selection.
+        function onCompanionChange() {
+            const compEl = document.getElementById('companion');
+            const companion = (compEl && selectedProtocol === 'chf') ? compEl.value : 'none';
+            isFullSession = (companion !== 'none');
+
+            const isN28 = (companion === 'n28' || companion === 'en28');
+            const isSy = (companion === 'sy' || companion === 'esy');
+
+            document.querySelectorAll('.companion-common').forEach(el => {
+                el.style.display = (isN28 || isSy) ? '' : 'none';
+            });
+            document.querySelectorAll('.companion-n28').forEach(el => {
+                el.style.display = isN28 ? '' : 'none';
+            });
+            document.querySelectorAll('.companion-sy').forEach(el => {
+                el.style.display = isSy ? '' : 'none';
+            });
+
+            // Keep the legacy enableEn28 flag in sync (backend backward-compat)
+            const en28Flag = document.getElementById('enableEn28');
+            if (en28Flag) en28Flag.checked = (companion === 'en28');
+
+            // Live banner so it's unmistakable what Start will do.
+            const banner = document.getElementById('companionBanner');
+            if (banner) {
+                if (companion === 'none') {
+                    banner.style.display = 'none';
+                } else {
+                    const labels = { n28: 'N28', en28: 'eN28', sy: 'Sy', esy: 'eSy' };
+                    const proto = labels[companion] || companion.toUpperCase();
+                    const action = isN28 ? 'SBI Subscribe' : 'Diameter SLR-Initial';
+                    banner.style.display = 'block';
+                    banner.textContent =
+                        `On Start: a ${proto} companion ${action} will be sent before the CHF session, ` +
+                        `then an Unsubscribe after it completes. Fill the ${proto} endpoint below ` +
+                        `(blank = same host as CHF).`;
+                }
+            }
+
+            // Notification panel is only relevant for the N28/eN28 companion
+            const notifPanel = document.getElementById('notificationPanel');
+            if (notifPanel) notifPanel.classList.toggle('visible', isN28);
+
+            // Auto-fill notifUri for N28/eN28
+            if (isN28) {
+                const notifUriEl = document.getElementById('notifUri');
+                if (notifUriEl && !notifUriEl.value) {
+                    notifUriEl.value = `http://${window.location.hostname}:${window.location.port || '8080'}/notifications/spendinglimit`;
+                }
             }
         }
 
         function toggleDiameterFields() {
             const diameterSection = document.getElementById('diameterFields');
-            const fqdnHint = document.getElementById('fqdnHint');
+            const endpointCard = document.getElementById('endpointCard');
             const isDiameter = diameterProtocols.includes(selectedProtocol);
+
+            // SBI-only fields (FQDN, Base Path, Nchf Version, HTTPS/Verify SSL,
+            // Test Connection) are irrelevant for Diameter (Gy/Ro), which connects
+            // via the Diameter Peer Address + Origin/Destination Host/Realm below.
+            document.querySelectorAll('.sbi-only').forEach(el => {
+                el.style.display = isDiameter ? 'none' : '';
+            });
+            // The whole Endpoint card is SBI-only content — hide it for Diameter.
+            if (endpointCard) endpointCard.style.display = isDiameter ? 'none' : '';
+
             if (isDiameter) {
                 diameterSection.classList.add('visible');
-                if (fqdnHint) fqdnHint.textContent =
-                    'For Diameter (Gy/Ro/Sy), the connection uses "Diameter Peer Address" below. This FQDN is only a fallback if that is blank.';
             } else {
                 diameterSection.classList.remove('visible');
+                const fqdnHint = document.getElementById('fqdnHint');
                 if (fqdnHint) fqdnHint.textContent = 'SBI (HTTP/2) endpoint host, e.g. eric-bss-cha-access...';
             }
         }
@@ -1237,7 +1362,7 @@
 
             // Persist to server (survives browser cache clears)
             const allSettings = {};
-            for (const proto of ['chf', 'pcf', 'gy', 'sy', 'ro', 'scapv2', 'full_session']) {
+            for (const proto of ['chf', 'gy', 'scapv2', 'ro']) {
                 const saved = localStorage.getItem(`sim_settings_${proto}`);
                 if (saved) allSettings[proto] = JSON.parse(saved);
             }
@@ -1298,7 +1423,7 @@
         function exportSettings() {
             const allSettings = {};
             // Gather settings for all protocols
-            for (const proto of ['chf', 'pcf', 'gy', 'sy', 'ro', 'scapv2', 'full_session']) {
+            for (const proto of ['chf', 'gy', 'scapv2', 'ro']) {
                 const saved = localStorage.getItem(`sim_settings_${proto}`);
                 if (saved) allSettings[proto] = JSON.parse(saved);
             }
@@ -1402,7 +1527,14 @@
             const ratingGroupsStr = document.getElementById('ratingGroups').value || '1000';
             const ratingGroups = ratingGroupsStr.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
 
+            // Re-derive companion mode live from the dropdown so a stale flag can
+            // never cause a selected companion to be silently skipped.
+            const compEl = document.getElementById('companion');
+            const companionSel = (compEl && selectedProtocol === 'chf') ? compEl.value : 'none';
+            isFullSession = (companionSel !== 'none');
+
             if (isFullSession) {
+                addLog(companionSel.toUpperCase(), 'Start', 'ok', `Companion selected — sending Subscribe + CHF via /api/traffic/start-full`);
                 startFullSession(speed, ratingGroups);
                 return;
             }
@@ -1477,8 +1609,9 @@
             });
         }
 
-        // ─── Start Full Session (eN28 + CHF) ─────────────────────────────────────
+        // ─── Start CHF + Companion Session (N28/eN28/Sy/eSy) ─────────────────────
         function startFullSession(speed, ratingGroups) {
+            const companion = document.getElementById('companion').value || 'none';
             const policyCounterIdsStr = document.getElementById('policyCounterIds').value || 'counter01';
             const policyCounterIds = policyCounterIdsStr.split(',').map(s => s.trim()).filter(s => s);
 
@@ -1487,11 +1620,22 @@
                 chf_port: parseInt(document.getElementById('port').value) || 443,
                 chf_base_path: document.getElementById('basePath').value || '/nchf-convergedcharging/v2',
                 chf_secure: document.getElementById('secure').checked,
+                companion: companion,
+                // N28 / eN28 companion endpoint
                 en28_fqdn: document.getElementById('en28Fqdn').value || null,
                 en28_port: document.getElementById('en28Port').value ? parseInt(document.getElementById('en28Port').value) : null,
                 en28_base_path: document.getElementById('en28BasePath').value || '/nchf-spendinglimitcontrol/v1',
                 en28_secure: document.getElementById('secure').checked,
                 notif_uri: document.getElementById('notifUri').value || `http://${window.location.hostname}:${window.location.port || '8080'}/notifications/spendinglimit`,
+                // Sy / eSy companion endpoint
+                sy_fqdn: document.getElementById('syFqdn').value || null,
+                sy_port: document.getElementById('syPort').value ? parseInt(document.getElementById('syPort').value) : null,
+                sy_base_path: document.getElementById('syBasePath').value || '',
+                sy_secure: document.getElementById('sySecure').checked,
+                sy_origin_host: document.getElementById('syOriginHost').value || null,
+                sy_origin_realm: document.getElementById('syOriginRealm').value || null,
+                sy_destination_host: document.getElementById('syDestHost').value || null,
+                sy_destination_realm: document.getElementById('syDestRealm').value || null,
                 subscriber: {
                     msisdn: document.getElementById('msisdn').value || '886912345678',
                     imsi: document.getElementById('imsi').value || '466010000000001',
@@ -1506,12 +1650,21 @@
                 },
                 policy_counter_ids: policyCounterIds,
                 initial_retrieval: document.getElementById('initialRetrieval').checked,
-                enable_en28: document.getElementById('enableEn28').checked,
+                enable_en28: (companion === 'en28'),
                 rating_groups: ratingGroups,
                 speed_mbps: speed,
                 session_duration_sec: parseInt(document.getElementById('sessionDuration').value) || 300,
                 num_sessions: parseInt(document.getElementById('numSessions').value) || 1
             };
+
+            // Scheduled event triggers (same parsing as startTraffic) so they
+            // fire during a companion (eSy/eN28/etc.) full session too.
+            const etRawF = (document.getElementById('eventTriggers') || {}).value || '';
+            const eventsF = etRawF.split(',').map(s => s.trim()).filter(Boolean).map(s => {
+                const [at, type] = s.split(':').map(x => (x || '').trim());
+                return { at: parseInt(at) || 0, type: type || 'RAT_CHANGE' };
+            });
+            if (eventsF.length) config.event_triggers = eventsF;
 
             fetch('/api/traffic/start-full', {
                 method: 'POST',
@@ -1525,8 +1678,9 @@
                     addLog('SYS', 'Start', 'error', data.error);
                 } else {
                     setStatus('running');
-                    addLog('eN28', 'Start', 'ok', `Full Session started — eN28 Subscribe + CHF at ${speed} Mbps`);
-                    addLog('eN28', 'Info', 'ok', `Counters: ${policyCounterIds.join(', ')}`);
+                    const label = companion.toUpperCase();
+                    addLog(label, 'Start', 'ok', `CHF + ${label} companion started at ${speed} Mbps`);
+                    if (policyCounterIds.length) addLog(label, 'Info', 'ok', `Counters: ${policyCounterIds.join(', ')}`);
                     connectWebSocket();
                 }
             })
@@ -1602,9 +1756,22 @@
                 addLog('eN28', 'Unsubscribe', status, msg.success ? `${msg.latency_ms.toFixed(0)}ms` : 'Unsubscribe failed');
                 return;
             }
+            if (msg.type === 'sy_subscribe') {
+                const label = (msg.companion || 'sy').toUpperCase();
+                const status = msg.success ? 'ok' : 'error';
+                addLog(label, 'SLR-Initial', status, msg.success ? `Session: ${msg.session_id || 'OK'} (${(msg.latency_ms||0).toFixed(0)}ms)` : 'SLR-Initial failed');
+                return;
+            }
+            if (msg.type === 'sy_unsubscribe') {
+                const label = (msg.companion || 'sy').toUpperCase();
+                const status = msg.success ? 'ok' : 'error';
+                addLog(label, 'SLR-Final', status, msg.success ? `${(msg.latency_ms||0).toFixed(0)}ms` : 'SLR-Final failed');
+                return;
+            }
             if (msg.type === 'full_session_complete') {
                 setStatus('completed');
-                addLog('eN28', 'Complete', 'ok', `Full session done — ${msg.en28_notifications_received} notification(s) received`);
+                const label = (msg.companion || 'eN28').toUpperCase();
+                addLog(label, 'Complete', 'ok', `Session done — ${msg.en28_notifications_received} notification(s) received`);
                 return;
             }
             if (msg.type === 'full_session_error') {
@@ -1866,7 +2033,7 @@
             const ratingGroups = ratingGroupsStr.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
 
             const config = {
-                protocol: selectedProtocol === 'full_session' ? 'chf' : selectedProtocol,
+                protocol: selectedProtocol,
                 fqdn: document.getElementById('fqdn').value || 'localhost',
                 port: parseInt(document.getElementById('port').value) || 443,
                 base_path: document.getElementById('basePath').value || null,
@@ -2279,7 +2446,7 @@
             resultDiv.textContent = 'Testing connection...';
 
             const config = {
-                protocol: selectedProtocol === 'full_session' ? 'chf' : selectedProtocol,
+                protocol: selectedProtocol,
                 fqdn: document.getElementById('fqdn').value || 'localhost',
                 port: parseInt(document.getElementById('port').value) || 443,
                 base_path: document.getElementById('basePath').value || '',
@@ -2314,22 +2481,21 @@
 
         // ─── Init on load ─────────────────────────────────────────────────────────
         document.addEventListener('DOMContentLoaded', () => {
-            // Restore last selected protocol
-            const lastProto = localStorage.getItem('sim_lastProtocol');
-            if (lastProto) {
-                const btn = document.querySelector(`.protocol-tabs button[data-protocol="${lastProto}"]`);
-                if (btn) {
-                    document.querySelectorAll('.protocol-tabs button').forEach(b => b.classList.remove('active'));
-                    btn.classList.add('active');
-                    selectedProtocol = lastProto;
-                    isFullSession = (selectedProtocol === 'full_session');
-                }
+            const validProtocols = ['chf', 'gy', 'scapv2', 'ro'];
+            // Restore last selected protocol (ignore removed protocols like pcf/sy/full_session)
+            let lastProto = localStorage.getItem('sim_lastProtocol');
+            if (!validProtocols.includes(lastProto)) lastProto = 'chf';
+            const btn = document.querySelector(`.protocol-tabs button[data-protocol="${lastProto}"]`);
+            if (btn) {
+                document.querySelectorAll('.protocol-tabs button').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                selectedProtocol = lastProto;
             }
             loadSavedSettings();
             onIdTypeChange();
             initCharts();
             toggleDiameterFields();
-            toggleFullSessionFields();
+            toggleFullSessionFields();  // also runs onCompanionChange() -> sets isFullSession
             refreshChfDiag();
             setInterval(refreshChfDiag, 5000);
             updateDefaultsForProtocol();

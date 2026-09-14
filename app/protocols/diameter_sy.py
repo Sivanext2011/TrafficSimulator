@@ -47,6 +47,10 @@ class DiameterSyProtocol(BaseProtocol):
             "PolicyCounter-2",
             "PolicyCounter-Accumulated",
         ])
+        # eSy: Ericsson Sy extension — request Policy Groups via a
+        # vendor-specific AVP (Vendor-Id 193 / ERICSSON), analogous to the
+        # E-N28 vendorSpecific-000193 extension on the SBI side.
+        self._enable_esy: bool = bool((subscriber or {}).get("enable_esy", False))
 
     def _generate_session_id(self) -> str:
         """Generate a Diameter-compliant Session-Id."""
@@ -94,6 +98,20 @@ class DiameterSyProtocol(BaseProtocol):
                 }
                 for counter_id in self._policy_counter_ids
             ]
+
+        # eSy (Ericsson Sy extension): request Policy Groups via a
+        # vendor-specific AVP. Parallel to the E-N28 vendorSpecific-000193
+        # block used on the SBI SpendingLimitControl side.
+        if self._enable_esy:
+            slr["Vendor-Specific-Application-Id"] = {
+                "Vendor-Id": 193,  # ERICSSON
+                "Auth-Application-Id": 16777302,  # Sy
+            }
+            slr["Ericsson-Policy-Group-Request"] = {
+                "Feature-Name": "ERICSSON_SLC",
+                "Feature-Version": "1.0.0",
+                "Request-Policy-Groups": True,
+            }
 
         return slr
 

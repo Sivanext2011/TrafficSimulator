@@ -38,6 +38,7 @@ class DiameterDiagnostics:
                        avps_decoded=None, raw: bytes = b""):
         entry = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            "epoch": time.time(),
             "direction": direction,               # "TX" or "RX"
             "peer": peer,
             "command_code": header.get("command_code"),
@@ -55,6 +56,87 @@ class DiameterDiagnostics:
         if peer:
             items = [m for m in items if m["peer"] == peer]
         return items[-limit:]
+
+    def to_pcap(self, peer: str = None, limit: int = 1000) -> bytes:
+        """Export captured Diameter messages as a libpcap (.pcap) byte stream.
+
+        Each stored message (raw Diameter bytes) is wrapped in synthetic
+        Ethernet/IPv4/TCP headers so it opens directly in Wireshark and is
+        dissected as Diameter (TCP port 3868). TX = client(10.10.10.1)->peer,
+        RX = peer->client. This is an offline reconstruction from the captured
+        payloads, not a live NIC capture — no admin rights or tcpdump needed.
+        """
+        items = list(self.messages)
+        if peer:
+            items = [m for m in items if m.get("peer") == peer]
+        items = items[-limit:]
+
+        LINKTYPE_ETHERNET = 1
+        # pcap global header: magic, ver 2.4, tz, sigfigs, snaplen, linktype
+        out = bytearray()
+        out += struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, LINKTYPE_ETHERNET)
+
+        client_ip = b"\x0a\x0a\x0a\x01"   # 10.10.10.1
+        server_ip = b"\x0a\x0a\x0a\x02"   # 10.10.10.2
+        client_mac = b"\x02\x00\x00\x00\x00\x01"
+        server_mac = b"\x02\x00\x00\x00\x00\x02"
+        seq_c = 1
+        seq_s = 1
+
+        def _ipv4_checksum(hdr: bytes) -> int:
+            s = 0
+            for i in range(0, len(hdr), 2):
+                s += (hdr[i] << 8) + hdr[i + 1]
+            s = (s >> 16) + (s & 0xFFFF)
+            s += (s >> 16)
+            return (~s) & 0xFFFF
+
+        for m in items:
+            hexs = m.get("hex") or ""
+            if not hexs:
+                continue
+            try:
+                payload = bytes.fromhex(hexs)
+            except ValueError:
+                continue
+            is_tx = (m.get("direction") == "TX")
+            if is_tx:
+                eth = server_mac + client_mac + b"\x08\x00"
+                src, dst = client_ip, server_ip
+                sport, dport = 49152, 3868
+            else:
+                eth = client_mac + server_mac + b"\x08\x00"
+                src, dst = server_ip, client_ip
+                sport, dport = 3868, 49152
+
+            # TCP header (20 bytes, PSH+ACK, no options)
+            tcp = struct.pack(
+                "!HHIIBBHHH",
+                sport, dport,
+                (seq_c if is_tx else seq_s), 0,
+                (5 << 4), 0x18, 65535, 0, 0,
+            )
+            if is_tx:
+                seq_c += len(payload)
+            else:
+                seq_s += len(payload)
+
+            total_len = 20 + len(tcp) + len(payload)
+            ip_hdr = struct.pack(
+                "!BBHHHBBH4s4s",
+                0x45, 0, total_len, 0, 0, 64, 6, 0, src, dst,
+            )
+            chk = _ipv4_checksum(ip_hdr)
+            ip_hdr = ip_hdr[:10] + struct.pack("!H", chk) + ip_hdr[12:]
+
+            frame = eth + ip_hdr + tcp + payload
+            ep = m.get("epoch") or time.time()
+            ts_sec = int(ep)
+            ts_usec = int((ep - ts_sec) * 1_000_000)
+            out += struct.pack("<IIII", ts_sec, ts_usec, len(frame), len(frame))
+            out += frame
+
+        return bytes(out)
 
     # ---- health ----
     def _peer(self, key: str) -> dict:
@@ -99,6 +181,8 @@ class CommandCode(IntEnum):
     CCR = 272  # Credit-Control (standard 3GPP DCCA)
     ERICSSON_CC = 16777214  # Ericsson CIP Credit-Control command (CBEV Gy via SDP)
     SLR = 8388635  # Spending-Limit (3GPP)
+    ERICSSON_SLR = 8388633  # Ericsson ESy Spending-Limit-Request (SLR/SLA)
+    ERICSSON_SNR = 8388634  # Ericsson ESy Spending-Status-Notification
     ASR = 274  # Abort-Session
     RAR = 258  # Re-Auth
 
@@ -106,6 +190,21 @@ class CommandCode(IntEnum):
 # Ericsson AB Diameter vendor id and CIP charging application id.
 ERICSSON_VENDOR_ID = 193
 ERICSSON_CHARGING_CIP_APP_ID = 16777232
+
+# 3GPP Sy (Spending-Limit-Control) application id (TS 29.219).
+SY_APPLICATION_ID = 16777302
+# Ericsson ESy (Policy Control over Ericsson Sy) application id. Per the
+# Ericsson Sy/ESy Interface Description the SLR/SLA/SNR/STR MUST carry
+# Auth-Application-Id = 16777304, otherwise CBEV terminates/mis-routes the
+# session (yielding a rating-path 5031 instead of a PolicyControlESy answer).
+ERICSSON_ESY_APPLICATION_ID = 16777304
+
+
+class SLRequestType(IntEnum):
+    """Sy SL-Request-Type AVP (2904) values, 3GPP TS 29.219."""
+    INITIAL = 0
+    INTERMEDIATE = 1
+    FINAL = 2
 
 
 class AVPCode(IntEnum):
@@ -151,10 +250,21 @@ class AVPCode(IntEnum):
     ORIGIN_STATE_ID = 278
     EVENT_TIMESTAMP = 55
     TERMINATION_CAUSE = 295
-    # Sy specific
+    # Sy specific (3GPP)
     SL_REQUEST_TYPE = 2904  # 3GPP
     POLICY_COUNTER_IDENTIFIER = 2901  # 3GPP
     POLICY_COUNTER_STATUS = 2903  # 3GPP
+    # Ericsson ESy specific (vendor 193), per Ericsson_Sy.xml rev E
+    ERIC_POLICY_GROUP = 1347
+    ERIC_POLICY_GROUP_NAME = 1348
+    ERIC_POLICY_GROUP_PRIORITY = 1349
+    ERIC_POLICY_GROUP_ACTIVATION_TIME = 1350
+    ERIC_POLICY_GROUP_DEACTIVATION_TIME = 1351
+    ERIC_POLICY_COUNTER_STATUS = 1352
+    ERIC_POLICY_COUNTER_POLICY_GROUP_NAME = 1353
+    ERIC_POLICY_COUNTER_IDENTIFIER = 1354
+    ERIC_POLICY_COUNTER_STATUS_REPORT = 1355  # Grouped
+    ERIC_SL_REQUEST_TYPE = 1356  # Enumerated (0 = INITIAL_REQUEST)
 
 
 class CCRequestType(IntEnum):
@@ -341,6 +451,62 @@ def decode_avps(data: bytes) -> List[dict]:
     return avps
 
 
+# Human-readable names for common AVP codes (for logging).
+_AVP_NAMES = {
+    263: "Session-Id", 264: "Origin-Host", 296: "Origin-Realm",
+    293: "Destination-Host", 283: "Destination-Realm", 258: "Auth-Application-Id",
+    260: "Vendor-Specific-Application-Id", 266: "Vendor-Id", 268: "Result-Code",
+    257: "Host-IP-Address", 269: "Product-Name", 267: "Firmware-Revision",
+    281: "Error-Message", 294: "Error-Reporting-Host", 279: "Failed-AVP",
+    443: "Subscription-Id", 450: "Subscription-Id-Type", 444: "Subscription-Id-Data",
+    416: "CC-Request-Type", 415: "CC-Request-Number", 432: "Rating-Group",
+    431: "Granted-Service-Unit", 446: "Used-Service-Unit", 437: "Requested-Service-Unit",
+    421: "CC-Total-Octets", 448: "Validity-Time", 461: "Service-Context-Id",
+    2904: "SL-Request-Type", 2901: "Policy-Counter-Identifier", 2903: "Policy-Counter-Status",
+    1347: "Policy-Group", 1348: "Policy-Group-Name", 1349: "Policy-Group-Priority",
+    1350: "Policy-Group-Activation-Time", 1351: "Policy-Group-Deactivation-Time",
+    1352: "Ericsson-Policy-Counter-Status", 1353: "Policy-Counter-Policy-Group-Name",
+    1354: "Ericsson-Policy-Counter-Identifier", 1355: "Ericsson-Policy-Counter-Status-Report",
+    1356: "Ericsson-SL-Request-Type", 55: "Event-Timestamp", 278: "Origin-State-Id",
+}
+
+# AVP codes whose value should be rendered as a UTF-8 string.
+_AVP_STRING_CODES = {263, 264, 296, 293, 283, 269, 281, 294, 444, 461,
+                     1348, 1352, 1353, 1354}
+# AVP codes that are grouped (recurse when formatting).
+_AVP_GROUPED_CODES = {260, 443, 431, 446, 437, 279, 297, 1347, 1355}
+
+
+def format_avps(avps: List[dict], indent: int = 2) -> str:
+    """Render decoded AVPs as a readable multi-line string for logging."""
+    pad = " " * indent
+    lines = []
+    for a in avps:
+        code = a.get("code")
+        vid = a.get("vendor_id", 0)
+        data = a.get("data", b"")
+        name = _AVP_NAMES.get(code, f"AVP-{code}")
+        vtag = f" (v{vid})" if vid else ""
+        if code in _AVP_GROUPED_CODES:
+            try:
+                inner = decode_avps(data)
+                lines.append(f"{pad}{name}{vtag}:")
+                lines.append(format_avps(inner, indent + 2))
+                continue
+            except Exception:
+                pass
+        if code in _AVP_STRING_CODES:
+            val = data.decode("utf-8", "replace")
+        elif len(data) == 4:
+            val = str(struct.unpack("!I", data)[0])
+        elif len(data) == 8:
+            val = str(struct.unpack("!Q", data)[0])
+        else:
+            val = data.hex()
+        lines.append(f"{pad}{name}{vtag} = {val}")
+    return "\n".join(lines)
+
+
 # ─── Diameter Transport ───────────────────────────────────────────────────────
 
 class DiameterTransport:
@@ -489,11 +655,17 @@ class DiameterTransport:
         try:
             self._writer.write(msg)
             await self._writer.drain()
+            _decoded_tx = decode_avps(b"".join(avps))
+            logger.info(
+                f">>> DIAMETER REQUEST cmd={command_code} app_id={app_id} "
+                f"hbh={hbh} len={len(msg)} peer={self.peer_key}\n"
+                f"{format_avps(_decoded_tx)}"
+            )
             DIAG.record_message("TX", self.peer_key,
                                 {"command_code": command_code, "is_request": True,
                                  "application_id": app_id, "hop_by_hop": hbh, "length": len(msg)},
                                 avps_decoded=[{"code": a["code"], "vendor_id": a.get("vendor_id", 0),
-                                               "len": len(a.get("data", b""))} for a in decode_avps(b"".join(avps))],
+                                               "len": len(a.get("data", b""))} for a in _decoded_tx],
                                 raw=msg)
             DIAG.set_state(self.peer_key, "connected", last_tx=time.strftime("%H:%M:%S", time.gmtime()))
 
@@ -585,6 +757,12 @@ class DiameterTransport:
                 avps = decode_avps(body_data)
                 header["avps"] = avps
 
+                logger.info(
+                    f"<<< DIAMETER {'REQUEST' if header['is_request'] else 'ANSWER'} "
+                    f"cmd={header['command_code']} app_id={header['application_id']} "
+                    f"hbh={header['hop_by_hop']} len={header['length']} peer={self.peer_key}\n"
+                    f"{format_avps(avps)}"
+                )
                 DIAG.record_message("RX", self.peer_key, header,
                                     avps_decoded=[{"code": a["code"], "vendor_id": a.get("vendor_id", 0),
                                                    "len": len(a.get("data", b""))} for a in avps],
@@ -1024,3 +1202,269 @@ class DiameterCCClient:
     def get_quota_state(self) -> dict:
         """Snapshot of per-rating-group quota state for reporting/UI."""
         return {rg: dict(q) for rg, q in self._quota.items()}
+
+
+# ─── Diameter Sy (Spending-Limit-Control) Client ──────────────────────────────
+
+class DiameterSyClient:
+    """Real Diameter Sy client (3GPP TS 29.219) over TCP/SCTP.
+
+    Sends actual Spending-Limit-Request (SLR) messages and parses the
+    Spending-Limit-Answer (SLA), reusing the base DiameterTransport for
+    CER/CEA, DWR/DWA and message framing:
+      - SLR-Initial      (SL-Request-Type = 0)  -> subscribe
+      - SLR-Intermediate (SL-Request-Type = 1)  -> update/query
+      - SLR-Final        (SL-Request-Type = 2)  -> unsubscribe
+
+    The Sy application id (16777302) is advertised via a
+    Vendor-Specific-Application-Id { Vendor-Id, Auth-Application-Id } grouped
+    AVP. For eSy (enable_esy=True) the Vendor-Id is Ericsson (193) and an
+    Ericsson vendor Policy-Counter-Identifier request marker is added; for
+    standard Sy the Vendor-Id is 3GPP (10415).
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        origin_host: str,
+        origin_realm: str,
+        destination_host: str = "",
+        destination_realm: str = "",
+        subscriber: dict = None,
+        policy_counter_ids: List[str] = None,
+        enable_esy: bool = False,
+    ):
+        self.subscriber = subscriber or {}
+        self.policy_counter_ids = [str(p) for p in (policy_counter_ids or [])]
+        self.enable_esy = enable_esy
+        # ESy uses the Ericsson application id 16777304 and Ericsson vendor id
+        # 193; standard 3GPP Sy uses 16777302 and vendor 10415. The application
+        # id selects the service context (PolicyControlESy) on CBEV, so it MUST
+        # match or the request is mis-routed to the rating path (5031).
+        if enable_esy:
+            self.app_id = ERICSSON_ESY_APPLICATION_ID  # 16777304
+            self.app_vendor_id = ERICSSON_VENDOR_ID     # 193
+        else:
+            self.app_id = SY_APPLICATION_ID             # 16777302
+            self.app_vendor_id = TGPP_VENDOR_ID         # 10415
+        self._session_id: Optional[str] = None
+        self._sl_request_number: int = 0
+        # Latest parsed policy counter statuses: {identifier: status_int}
+        self.policy_counter_status: Dict[str, int] = {}
+        self.policy_groups: List[dict] = []
+        self.error_message: Optional[str] = None
+
+        self._transport = DiameterTransport(
+            host=host,
+            port=port,
+            origin_host=origin_host,
+            origin_realm=origin_realm,
+            destination_host=destination_host,
+            destination_realm=destination_realm,
+            auth_app_ids=[self.app_id],
+        )
+
+    @property
+    def session_id(self) -> Optional[str]:
+        return self._session_id
+
+    async def connect(self) -> bool:
+        """Open the TCP association and perform CER/CEA (idempotent)."""
+        return await self._transport.ensure_connected()
+
+    async def disconnect(self):
+        await self._transport.disconnect()
+
+    # keep a close() alias so orchestration can treat it like the other clients
+    async def close(self):
+        await self._transport.disconnect()
+
+    def _build_subscription_id(self) -> List[bytes]:
+        avps = []
+        msisdn = self.subscriber.get("msisdn", "")
+        imsi = self.subscriber.get("imsi", "")
+        if msisdn:
+            avps.append(encode_grouped_avp(AVPCode.SUBSCRIPTION_ID, [
+                encode_uint32_avp(AVPCode.SUBSCRIPTION_ID_TYPE, SubscriptionIdType.END_USER_E164),
+                encode_utf8_avp(AVPCode.SUBSCRIPTION_ID_DATA, msisdn),
+            ]))
+        if imsi:
+            avps.append(encode_grouped_avp(AVPCode.SUBSCRIPTION_ID, [
+                encode_uint32_avp(AVPCode.SUBSCRIPTION_ID_TYPE, SubscriptionIdType.END_USER_IMSI),
+                encode_utf8_avp(AVPCode.SUBSCRIPTION_ID_DATA, imsi),
+            ]))
+        return avps
+
+    def _build_slr_avps(self, sl_request_type: int) -> List[bytes]:
+        """Build the SLR AVP list.
+
+        For eSy (enable_esy=True) this follows the Ericsson ESy dictionary
+        (Ericsson_Sy.xml rev E, Ericsson-SLR-Initial, command 8388633):
+          Session-Id, Origin-Host, Origin-Realm, Destination-Realm,
+          Auth-Application-Id (plain), [Destination-Host], [Origin-State-Id],
+          Ericsson-SL-Request-Type (1356, vendor 193, =0), Subscription-Id.
+          No Policy-Counter-Identifier in the request; no
+          Vendor-Specific-Application-Id.
+        For standard 3GPP Sy it follows TS 29.219 (SL-Request-Type 2904 via
+        Vendor-Specific-Application-Id).
+        """
+        if self.enable_esy:
+            avps = [
+                encode_utf8_avp(AVPCode.SESSION_ID, self._session_id),
+                encode_utf8_avp(AVPCode.ORIGIN_HOST, self._transport.origin_host),
+                encode_utf8_avp(AVPCode.ORIGIN_REALM, self._transport.origin_realm),
+                encode_utf8_avp(AVPCode.DESTINATION_REALM, self._transport.destination_realm),
+                # Plain Auth-Application-Id (occurrence=1 in the ESy dictionary).
+                encode_uint32_avp(AVPCode.AUTH_APPLICATION_ID, self.app_id),
+            ]
+            if self._transport.destination_host:
+                avps.append(encode_utf8_avp(AVPCode.DESTINATION_HOST, self._transport.destination_host))
+            # Ericsson-SL-Request-Type (1356, vendor 193). Only INITIAL(0) is
+            # defined by the dictionary.
+            avps.append(encode_uint32_avp(AVPCode.ERIC_SL_REQUEST_TYPE, 0, ERICSSON_VENDOR_ID))
+            # Subscription-Id(s)
+            avps.extend(self._build_subscription_id())
+            return avps
+
+        # ── Standard 3GPP Sy ──
+        vsai = encode_grouped_avp(AVPCode.VENDOR_SPECIFIC_APP_ID, [
+            encode_uint32_avp(AVPCode.VENDOR_ID, self.app_vendor_id),
+            encode_uint32_avp(AVPCode.AUTH_APPLICATION_ID, self.app_id),
+        ])
+        avps = [
+            encode_utf8_avp(AVPCode.SESSION_ID, self._session_id),
+            encode_utf8_avp(AVPCode.ORIGIN_HOST, self._transport.origin_host),
+            encode_utf8_avp(AVPCode.ORIGIN_REALM, self._transport.origin_realm),
+            encode_utf8_avp(AVPCode.DESTINATION_REALM, self._transport.destination_realm),
+            vsai,
+        ]
+        if self._transport.destination_host:
+            avps.append(encode_utf8_avp(AVPCode.DESTINATION_HOST, self._transport.destination_host))
+        avps.append(encode_uint32_avp(AVPCode.SL_REQUEST_TYPE, sl_request_type, TGPP_VENDOR_ID))
+        avps.extend(self._build_subscription_id())
+        for pc in self.policy_counter_ids:
+            avps.append(encode_utf8_avp(AVPCode.POLICY_COUNTER_IDENTIFIER, pc, TGPP_VENDOR_ID))
+        return avps
+
+    def _parse_sla(self, answer: dict) -> Tuple[int, Dict[str, str]]:
+        """Parse Result-Code and policy counter statuses from an SLA.
+
+        Handles both the Ericsson ESy layout (Ericsson-Policy-Counter-Status-
+        Report 1355 -> Ericsson-Policy-Counter-Identifier 1354 +
+        Ericsson-Policy-Counter-Status 1352 + Policy-Counter-Policy-Group-Name
+        1353) and the 3GPP layout (Policy-Counter-Identifier 2901 +
+        Policy-Counter-Status 2903).
+        """
+        result_code = 0
+        statuses: Dict[str, str] = {}
+        self.policy_groups = []
+        self.error_message = None
+
+        for avp in answer.get("avps", []):
+            code = avp.get("code")
+            data = avp.get("data", b"")
+            if code == AVPCode.RESULT_CODE and len(data) >= 4:
+                result_code = struct.unpack("!I", data[:4])[0]
+            elif code == AVPCode.ERIC_POLICY_COUNTER_STATUS_REPORT:
+                # Ericsson grouped: identifier(1354) + status(1352) + group-name(1353)
+                pid = pstatus = pgroup = None
+                for iavp in decode_avps(data):
+                    if iavp["code"] == AVPCode.ERIC_POLICY_COUNTER_IDENTIFIER:
+                        pid = iavp["data"].decode("utf-8", "replace")
+                    elif iavp["code"] == AVPCode.ERIC_POLICY_COUNTER_STATUS:
+                        pstatus = iavp["data"].decode("utf-8", "replace")
+                    elif iavp["code"] == AVPCode.ERIC_POLICY_COUNTER_POLICY_GROUP_NAME:
+                        pgroup = iavp["data"].decode("utf-8", "replace")
+                if pid is not None:
+                    statuses[pid] = pstatus
+                    if pgroup:
+                        statuses[f"{pid}@group"] = pgroup
+            elif code == AVPCode.ERIC_POLICY_GROUP:
+                grp = {}
+                for iavp in decode_avps(data):
+                    if iavp["code"] == AVPCode.ERIC_POLICY_GROUP_NAME:
+                        grp["name"] = iavp["data"].decode("utf-8", "replace")
+                    elif iavp["code"] == AVPCode.ERIC_POLICY_GROUP_PRIORITY and len(iavp["data"]) >= 4:
+                        grp["priority"] = struct.unpack("!I", iavp["data"][:4])[0]
+                if grp:
+                    self.policy_groups.append(grp)
+            elif code == 281:  # Error-Message
+                self.error_message = data.decode("utf-8", "replace")
+
+        # 3GPP fallback: scan any grouped AVP for Policy-Counter-Identifier(2901)
+        if not statuses:
+            for avp in answer.get("avps", []):
+                data = avp.get("data", b"")
+                if not data:
+                    continue
+                try:
+                    inner = decode_avps(data)
+                except Exception:
+                    continue
+                pid = pstatus = None
+                for iavp in inner:
+                    if iavp["code"] == AVPCode.POLICY_COUNTER_IDENTIFIER:
+                        pid = iavp["data"].decode("utf-8", "replace")
+                    elif iavp["code"] == AVPCode.POLICY_COUNTER_STATUS:
+                        pstatus = iavp["data"].decode("utf-8", "replace")
+                if pid is not None:
+                    statuses[pid] = pstatus
+        return result_code, statuses
+
+    async def _send_slr(self, sl_request_type: int) -> Tuple[bool, float, Optional[dict]]:
+        if not self._transport.connected:
+            return False, 0.0, None
+
+        start = time.perf_counter()
+        avps = self._build_slr_avps(sl_request_type)
+        cmd = CommandCode.ERICSSON_SLR if self.enable_esy else CommandCode.SLR
+        logger.debug(
+            f"TX SLR cmd={int(cmd)} sl_request_type={sl_request_type} app_id={self.app_id} "
+            f"vendor={self.app_vendor_id} navps={len(avps)} "
+            f"dest_realm={self._transport.destination_realm} esy={self.enable_esy}"
+        )
+        # SLR must be relayable through the DLB -> set the P-bit.
+        answer = await self._transport.send_request(
+            cmd, self.app_id, avps, proxiable=True
+        )
+        latency_ms = (time.perf_counter() - start) * 1000.0
+
+        if answer is None:
+            return False, latency_ms, None
+
+        result_code, statuses = self._parse_sla(answer)
+        if statuses:
+            self.policy_counter_status.update(statuses)
+        success = result_code in (2001, 0)
+        logger.debug(f"SLA result_code={result_code} statuses={statuses} success={success}")
+        return success, latency_ms, {
+            "result_code": result_code,
+            "policy_counter_status": dict(self.policy_counter_status),
+            "answer": answer,
+        }
+
+    async def create_session(self) -> Tuple[bool, float]:
+        """SLR-Initial (subscribe)."""
+        self._session_id = f"{self._transport.origin_host};{int(time.time())};{uuid.uuid4().hex[:8]}"
+        self._sl_request_number = 0
+        ok, latency, _ = await self._send_slr(SLRequestType.INITIAL)
+        return ok, latency
+
+    async def update_session(self, sequence: int = 0) -> Tuple[bool, float]:
+        """SLR-Intermediate (update/query)."""
+        if not self._session_id:
+            return False, 0.0
+        self._sl_request_number += 1
+        ok, latency, _ = await self._send_slr(SLRequestType.INTERMEDIATE)
+        return ok, latency
+
+    async def release_session(self) -> Tuple[bool, float]:
+        """SLR-Final (unsubscribe)."""
+        if not self._session_id:
+            return False, 0.0
+        self._sl_request_number += 1
+        ok, latency, _ = await self._send_slr(SLRequestType.FINAL)
+        if ok:
+            self._session_id = None
+        return ok, latency

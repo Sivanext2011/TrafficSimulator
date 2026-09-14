@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.consumption_engine import ConsumptionEngine
-from app.protocols.diameter_stack import DiameterCCClient, CCRequestType, decode_avps, DIAG
+from app.protocols.diameter_stack import DiameterCCClient, DiameterSyClient, CCRequestType, decode_avps, DIAG
 from app.protocols.chf import ChfProtocol
 from app.protocols.pcf import PcfProtocol
 from app.protocols.diameter_gy import DiameterGyProtocol
@@ -63,6 +63,13 @@ ring_handler.setLevel(logging.DEBUG)
 ring_handler.setFormatter(logging.Formatter("%(message)s"))
 
 logging.basicConfig(level=logging.DEBUG, handlers=[file_handler, console_handler, ring_handler])
+
+# Quiet extremely chatty third-party DEBUG logs (httpx/httpcore emit dozens of
+# lines per request) so the in-memory ring buffer retains the meaningful CHF
+# request/response lines instead of rolling them out. The disk file handler
+# still records everything.
+for _noisy in ("httpx", "httpcore", "hpack", "h2", "asyncio"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 from app.protocols.diameter_ro import DiameterRoProtocol
 from app.protocols.scapv2 import ScapV2Protocol
@@ -160,6 +167,7 @@ CHF_DIAG = ChfDiagnostics()
 # eN28 notification storage
 en28_notifications: List[dict] = []
 en28_spending_limit_client: Optional[SpendingLimitClient] = None
+sy_companion_client: Optional["DiameterSyClient"] = None
 full_session_task: Optional[asyncio.Task] = None
 
 # Persistent Diameter clients, keyed by peer identity. The Diameter peer (DLB)
@@ -355,6 +363,10 @@ class ChfSessionHandler:
             },
             "invocationTimeStamp": timestamp,
             "invocationSequenceNumber": 0,
+            # supportedFeatures (Nchf feature negotiation, hex string). The CHF
+            # re-arms triggers on an Update when this NEGOTIATED value changes,
+            # so the simulator can drive that by sending a different value later.
+            "supportedFeatures": str(sub.get("supported_features", "0")),
             # Real SMF sends the notification callback URI for CHF-initiated reporting
             "notifyUri": sub.get(
                 "notify_uri",
@@ -445,6 +457,10 @@ class ChfSessionHandler:
                     # Real SMF sends IMEISV, not IMEI
                     "servedPEI": sub.get("pei") or "imeisv-3525566012011313",
                     "unauthenticatedFlag": False,
+                    # Roaming position at session start. CBEV accepts roamerInOut
+                    # as a STRING enum (IN_BOUND / OUT_BOUND); an integer is
+                    # rejected with 400 OPTIONAL_IE_INCORRECT. Start as inroamer.
+                    "roamerInOut": str(sub.get("create_roamer_in_out", "IN_BOUND")),
                 },
             },
         }
@@ -464,6 +480,13 @@ class ChfSessionHandler:
             containers = u.get("usedUnitContainer", [])
             enriched_containers = []
             for c in containers:
+                # Preserve the ACTUAL trigger(s) that fired (VALIDITY_TIME,
+                # QUOTA_THRESHOLD, TIME_LIMIT, RAT_CHANGE, PLMN_CHANGE, ...) as
+                # set by the consumption engine. Only fall back to VOLUME_LIMIT
+                # when the container carries no triggers.
+                container_triggers = c.get("triggers") or [
+                    {"triggerCategory": "IMMEDIATE_REPORT", "triggerType": "VOLUME_LIMIT"}
+                ]
                 enriched_containers.append({
                     "totalVolume": c.get("totalVolume", 0),
                     "downlinkVolume": c.get("downlinkVolume", 0),
@@ -474,13 +497,8 @@ class ChfSessionHandler:
                     # Real SMF reports first/last usage timestamps in the container
                     "timeofFirstUsage": c.get("timeofFirstUsage", timestamp),
                     "timeofLastUsage": c.get("timeofLastUsage", timestamp),
-                    "triggerTimestamp": timestamp,
-                    "triggers": [
-                        {
-                            "triggerCategory": "IMMEDIATE_REPORT",
-                            "triggerType": "VOLUME_LIMIT",
-                        }
-                    ],
+                    "triggerTimestamp": c.get("triggerTimestamp", timestamp),
+                    "triggers": container_triggers,
                 })
 
             mscc_list.append({
@@ -494,6 +512,9 @@ class ChfSessionHandler:
         payload = {
             "invocationSequenceNumber": sequence,
             "invocationTimeStamp": timestamp,
+            # Current negotiated supportedFeatures; if it differs from a prior
+            # request the CHF re-evaluates and may re-arm triggers.
+            "supportedFeatures": str(sub.get("supported_features", "0")),
             "multipleUnitUsage": mscc_list,
             "nfConsumerIdentification": {
                 "nFIPv4Address": sub.get("nf_ip", "192.168.0.1"),
@@ -525,11 +546,57 @@ class ChfSessionHandler:
                     "servedGPSI": gpsi,
                     "servedPEI": sub.get("pei") or "imeisv-3525566012011313",
                     "unauthenticatedFlag": False,
+                    # Baseline: inroamer. Roaming update overwrites to OUT_BOUND.
+                    "roamerInOut": "IN_BOUND",
                 },
             },
         }
         if supi:
             payload["subscriberIdentifier"] = supi
+        # isRoamingUpdate: set true only when the session flagged a roaming
+        # update (drives the CHF to re-arm QBC triggers on this Update). It is
+        # one-shot — cleared after being sent so only this Update carries it.
+        if sub.get("is_roaming_update"):
+            pdu = payload["pDUSessionChargingInformation"]
+            pdu["isRoamingUpdate"] = True
+            # A bare isRoamingUpdate flag is not enough — CBEV determines roaming
+            # by comparing the SERVING PLMN against the HOME PLMN. Present a
+            # VISITED serving PLMN (different from home mcc/mnc) so this is a
+            # genuine roaming/PLMN-change update that can activate QBC handling.
+            vmcc = str(sub.get("visited_mcc", "310"))
+            vmnc = str(sub.get("visited_mnc", "260"))
+            pdu["pduSessionInformation"] = {
+                "pduSessionID": int(sub.get("pdu_session_id", 1)),
+                "dnnId": sub.get("dnn", "internet"),
+                "hPlmnId": {"mcc": mcc, "mnc": mnc},
+                "servingCNPlmnId": {"mcc": vmcc, "mnc": vmnc},
+            }
+            # Reflect the visited PLMN in the reported user location too.
+            pdu["userLocationinfo"]["nrLocation"]["tai"]["plmnId"] = {"mcc": vmcc, "mnc": vmnc}
+            pdu["userLocationinfo"]["nrLocation"]["ncgi"]["plmnId"] = {"mcc": vmcc, "mnc": vmnc}
+            # Flip roaming position to outroamer. CBEV accepts roamerInOut as a
+            # STRING enum (integer -> 400 OPTIONAL_IE_INCORRECT).
+            pdu["userInformation"]["roamerInOut"] = str(sub.get("roamer_in_out", "OUT_BOUND"))
+            # Per CBEV 23.10 CPI (CHA Converged Rate and Charge Function Guide,
+            # LZN40100871.4.4, Table 50) the documented prerequisite for CBEV to
+            # return roamingQBCInformation.roamingChargingProfile.triggers is that
+            # the SMF SENDS a roaming charging profile in the request. 3GPP TS
+            # 32.291 places it at:
+            #   pDUSessionChargingInformation.roamingQBCInformation.roamingChargingProfile
+            # with an optional triggers[] (RoamingTrigger: triggerType, timeLimit,
+            # volumeLimit) and partialRecordMethod. CBEV's configured QBC triggers
+            # then OVERRIDE this profile in the response.
+            pdu["roamingQBCInformation"] = {
+                "roamingChargingProfile": {
+                    "triggers": [
+                        {"triggerType": "TIME_LIMIT", "timeLimit": int(sub.get("qbc_time_limit", 60))},
+                        {"triggerType": "VOLUME_LIMIT", "volumeLimit": int(sub.get("qbc_volume_limit", 1048576))},
+                    ],
+                    "partialRecordMethod": sub.get("qbc_partial_record_method", "DEFAULT"),
+                },
+                "uPFID": sub.get("upf_id", "123e4567-e89b-12d3-a456-426655440001"),
+            }
+            sub["is_roaming_update"] = False
         return payload
 
     def _build_release_payload(self, sequence: int, used_units: List[dict]) -> dict:
@@ -1254,7 +1321,12 @@ async def delete_profile(name: str):
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html_path = Path(__file__).parent / "static" / "index.html"
-    return html_path.read_text(encoding="utf-8")
+    # Always serve the freshest UI — prevents a stale cached page from
+    # silently running old behaviour (e.g. an old companion selection).
+    return HTMLResponse(
+        content=html_path.read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 @app.post("/api/certs/upload")
@@ -1427,6 +1499,24 @@ async def stop_traffic():
 async def diameter_messages(limit: int = 50, peer: Optional[str] = None):
     """Recent Diameter messages (TX/RX) with decoded AVP summary + hex."""
     return {"messages": DIAG.get_messages(limit=limit, peer=peer)}
+
+
+@app.get("/api/diameter/pcap")
+async def diameter_pcap(peer: Optional[str] = None, limit: int = 1000):
+    """Download the captured Diameter traffic as a Wireshark-openable .pcap.
+
+    Optional packet capture: reconstructs the real Diameter bytes (CER/CEA,
+    CCR/CCA, SLR/SLA) that the simulator sent/received into a libpcap file,
+    framed as TCP/3868 so Wireshark dissects it as Diameter. No tcpdump,
+    Npcap, or admin rights required.
+    """
+    data = DIAG.to_pcap(peer=peer, limit=limit)
+    fname = time.strftime("diameter-%Y%m%d-%H%M%S.pcap", time.gmtime())
+    return Response(
+        content=data,
+        media_type="application/vnd.tcpdump.pcap",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 @app.get("/api/diameter/status")
@@ -2387,18 +2477,41 @@ async def clear_en28_notifications():
 # ─── Full Session Mode (eN28 + Nchf_ConvergedCharging) ───────────────────────
 
 class FullSessionConfig(BaseModel):
-    """Configuration for Full Session mode: eN28 Subscribe → CHF → Unsubscribe."""
+    """Configuration for a CHF traffic session with an optional companion
+    Spending-Limit-Control leg.
+
+    The companion runs a Subscribe before the CHF charging session and an
+    Unsubscribe after it completes:
+      - none        : CHF only (no companion)
+      - n28 / en28  : SBI Nchf_SpendingLimitControl (en28 = Ericsson extension)
+      - sy  / esy   : Diameter Sy Spending-Limit (esy = Ericsson extension)
+    """
     # CHF endpoint (Nchf_ConvergedCharging)
     chf_fqdn: str
     chf_port: int = 443
     chf_base_path: str = "/nchf-convergedcharging/v2"
     chf_secure: bool = True
 
+    # Which companion Spending-Limit protocol to run alongside CHF.
+    # One of: "none", "n28", "en28", "sy", "esy".
+    companion: str = "en28"
+
     # eN28 endpoint (Nchf_SpendingLimitControl) - can be same or different host
     en28_fqdn: Optional[str] = None  # defaults to chf_fqdn if not set
     en28_port: Optional[int] = None  # defaults to chf_port if not set
     en28_base_path: str = "/nchf-spendinglimitcontrol/v1"
     en28_secure: bool = True
+
+    # Diameter Sy companion endpoint (HTTP-simulated SLR). Defaults to the CHF
+    # host if not set. base_path is prepended to /diameter/sy/slr.
+    sy_fqdn: Optional[str] = None
+    sy_port: Optional[int] = None
+    sy_base_path: str = ""
+    sy_secure: bool = False
+    sy_origin_host: Optional[str] = None
+    sy_origin_realm: Optional[str] = None
+    sy_destination_host: Optional[str] = None
+    sy_destination_realm: Optional[str] = None
 
     # Callback URI for eN28 notifications (must be reachable from CHF)
     notif_uri: str = "http://localhost:8080/notifications/spendinglimit"
@@ -2416,40 +2529,51 @@ class FullSessionConfig(BaseModel):
     speed_mbps: float = 10.0
     session_duration_sec: int = 300
     num_sessions: int = 1
+    # Scheduled mid-session event triggers (same as /api/traffic/start):
+    # list of {"at": <elapsed_sec:int>, "type": <triggerType:str>}.
+    event_triggers: Optional[List[dict]] = None
 
 
 @app.post("/api/traffic/start-full")
 async def start_full_session(config: FullSessionConfig):
-    """Start a Full Session: eN28 Subscribe → CHF Create → Consume → Release → Unsubscribe."""
-    global en28_spending_limit_client, full_session_task
+    """Start a CHF session with an optional companion Spending-Limit leg.
+
+    companion = none  -> CHF only
+    companion = n28/en28 -> SBI Nchf_SpendingLimitControl Subscribe → CHF → Unsubscribe
+    companion = sy/esy   -> Diameter Sy SLR-Initial → CHF → SLR-Final
+    """
+    global en28_spending_limit_client, sy_companion_client, full_session_task
 
     try:
         # Stop any existing session
         if full_session_task and not full_session_task.done():
             await stop_full_session_internal()
 
-        # Clear previous notifications
+        # Clear previous notifications / stale companion clients
         en28_notifications.clear()
+        en28_spending_limit_client = None
+        sy_companion_client = None
+
+        # Normalize companion selection. Backward-compat: legacy callers that
+        # only set enable_en28 (and no companion) still get the E-N28 leg.
+        companion = (config.companion or "en28").strip().lower()
+        if companion not in ("none", "n28", "en28", "sy", "esy"):
+            companion = "en28"
+        if config.enable_en28 and companion in ("none", "n28", "en28"):
+            companion = "en28"
+
+        # Diagnostic: record exactly what the client sent for triggers so the
+        # log makes it obvious whether the UI included them.
+        logger.info(
+            f"START-FULL received: companion={companion} "
+            f"event_triggers={config.event_triggers!r} "
+            f"session_duration_sec={config.session_duration_sec}"
+        )
 
         # Resolve cert paths
         cert_profile = CERT_DIR / "default"
         cert_path = str(cert_profile / "client.crt") if (cert_profile / "client.crt").exists() else None
         key_path = str(cert_profile / "client.key") if (cert_profile / "client.key").exists() else None
-
-        # Resolve eN28 endpoint (defaults to CHF if not specified)
-        en28_fqdn = config.en28_fqdn or config.chf_fqdn
-        en28_port = config.en28_port or config.chf_port
-
-        # Create spending limit client
-        en28_spending_limit_client = SpendingLimitClient(
-            fqdn=en28_fqdn,
-            port=en28_port,
-            base_path=config.en28_base_path,
-            cert_path=cert_path,
-            key_path=key_path,
-            secure=config.en28_secure,
-            verify_ssl=False,
-        )
 
         # Create CHF session handler
         chf_fqdn = config.chf_fqdn.strip()
@@ -2476,55 +2600,114 @@ async def start_full_session(config: FullSessionConfig):
         supi = f"imsi-{sub.imsi}"
         gpsi = f"msisdn-{sub.msisdn}"
 
-        # Check notifUri reachability — warn if localhost
+        # ─── Build the companion client based on selection ────────────────────
+        companion_endpoint = None
         notif_uri = config.notif_uri
         notif_uri_warning = None
-        if "localhost" in notif_uri or "127.0.0.1" in notif_uri:
-            # Try to detect a routable local IP
-            import socket
+
+        if companion in ("n28", "en28"):
+            # SBI Nchf_SpendingLimitControl companion
+            enable_en28 = (companion == "en28")
+            en28_fqdn = config.en28_fqdn or chf_fqdn
+            en28_port = config.en28_port or config.chf_port
+
+            en28_spending_limit_client = SpendingLimitClient(
+                fqdn=en28_fqdn,
+                port=en28_port,
+                base_path=config.en28_base_path,
+                cert_path=cert_path,
+                key_path=key_path,
+                secure=config.en28_secure,
+                verify_ssl=False,
+            )
+            companion_endpoint = (
+                f"{'https' if config.en28_secure else 'http'}://"
+                f"{en28_fqdn}:{en28_port}{config.en28_base_path}"
+            )
+
+            # Check notifUri reachability — warn if localhost
+            if "localhost" in notif_uri or "127.0.0.1" in notif_uri:
+                import socket
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect((en28_fqdn, en28_port))
+                    local_ip = s.getsockname()[0]
+                    s.close()
+                    suggested_uri = notif_uri.replace("localhost", local_ip).replace("127.0.0.1", local_ip)
+                    notif_uri_warning = (
+                        f"WARNING: notifUri uses localhost — CHF cannot reach your simulator. "
+                        f"Suggested: {suggested_uri}"
+                    )
+                    logger.warning(notif_uri_warning)
+                except Exception:
+                    notif_uri_warning = "WARNING: notifUri uses localhost — CHF cannot send notifications back to your simulator"
+                    logger.warning(notif_uri_warning)
+                await broadcast_metrics({
+                    "type": "full_session_warning",
+                    "message": notif_uri_warning,
+                })
+
+        elif companion in ("sy", "esy"):
+            # Real Diameter Sy companion (SLR/SLA over TCP/SCTP).
+            enable_esy = (companion == "esy")
+            # sy_fqdn/sy_port are the Diameter PEER transport address (IP/FQDN +
+            # port), defaulting to the CHF host and the standard Diameter port.
+            sy_host = config.sy_fqdn or chf_fqdn
+            sy_port = config.sy_port or 3868
+            sy_client_obj = DiameterSyClient(
+                host=sy_host,
+                port=sy_port,
+                origin_host=config.sy_origin_host or "sy-simulator.local",
+                origin_realm=config.sy_origin_realm or "simulator.local",
+                destination_host=config.sy_destination_host or "",
+                destination_realm=config.sy_destination_realm or "epc.mnc001.mcc001.3gppnetwork.org",
+                subscriber=config.subscriber.model_dump(),
+                policy_counter_ids=config.policy_counter_ids,
+                enable_esy=enable_esy,
+            )
+            # Establish the Diameter association (CER/CEA) up front so the UI
+            # start response reflects connectivity; the SLR-Initial is sent in
+            # Phase 1 of the orchestration.
             try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect((en28_fqdn, en28_port))
-                local_ip = s.getsockname()[0]
-                s.close()
-                suggested_uri = notif_uri.replace("localhost", local_ip).replace("127.0.0.1", local_ip)
-                notif_uri_warning = (
-                    f"WARNING: notifUri uses localhost — CHF cannot reach your simulator. "
-                    f"Suggested: {suggested_uri}"
-                )
-                logger.warning(notif_uri_warning)
-            except Exception:
-                notif_uri_warning = "WARNING: notifUri uses localhost — CHF cannot send notifications back to your simulator"
-                logger.warning(notif_uri_warning)
+                connected = await asyncio.wait_for(sy_client_obj.connect(), timeout=12.0)
+            except (asyncio.TimeoutError, Exception) as e:
+                connected = False
+                logger.error(f"Diameter Sy connect failed: {e}")
+            sy_companion_client = sy_client_obj
+            _slr_cmd = 8388633 if enable_esy else 8388635
+            companion_endpoint = (
+                f"diameter://{sy_host}:{sy_port} "
+                f"(app={sy_client_obj.app_id}, SLR cmd {_slr_cmd}"
+                f"{', eSy vendor 193' if enable_esy else ''})"
+                f"{'' if connected else ' [CER/CEA failed]'}"
+            )
 
-            # Broadcast the warning to the UI
-            await broadcast_metrics({
-                "type": "full_session_warning",
-                "message": notif_uri_warning,
-            })
-
-        # Start the full session orchestration as a background task
+        # Start the orchestration as a background task
         full_session_task = asyncio.create_task(
             _run_full_session(
                 slc_client=en28_spending_limit_client,
+                sy_client=sy_companion_client,
+                companion=companion,
                 chf_handler=chf_handler,
                 supi=supi,
                 gpsi=gpsi,
                 notif_uri=config.notif_uri,
                 policy_counter_ids=config.policy_counter_ids,
                 initial_retrieval=config.initial_retrieval,
-                enable_en28=config.enable_en28,
+                enable_en28=(companion == "en28"),
                 rating_groups=config.rating_groups,
                 speed_mbps=config.speed_mbps,
                 session_duration_sec=config.session_duration_sec,
                 num_sessions=config.num_sessions,
+                event_triggers=config.event_triggers,
             )
         )
 
         response = {
             "status": "started",
             "mode": "full_session",
-            "en28_endpoint": f"{'https' if config.en28_secure else 'http'}://{en28_fqdn}:{en28_port}{config.en28_base_path}",
+            "companion": companion,
+            "companion_endpoint": companion_endpoint,
             "chf_endpoint": f"{'https' if config.chf_secure else 'http'}://{chf_fqdn}:{config.chf_port}{config.chf_base_path}",
             "notif_uri": notif_uri,
             "policy_counter_ids": config.policy_counter_ids,
@@ -2549,7 +2732,7 @@ async def stop_full_session():
 
 async def stop_full_session_internal():
     """Internal helper to stop the full session."""
-    global full_session_task, en28_spending_limit_client
+    global full_session_task, en28_spending_limit_client, sy_companion_client
 
     # Stop the consumption engine first
     await consumption_engine.stop()
@@ -2573,14 +2756,26 @@ async def stop_full_session_internal():
     else:
         logger.info("eN28: already unsubscribed or no client — skipping")
 
-    # Close the client
+    # Close the eN28 client
     if en28_spending_limit_client:
         await en28_spending_limit_client.close()
         en28_spending_limit_client = None
 
+    # Release/close the Sy companion (only if still subscribed)
+    if sy_companion_client:
+        try:
+            if sy_companion_client.session_id:
+                sy_ok, sy_latency = await sy_companion_client.release_session()
+                logger.info(f"Sy SLR-Final on stop: success={sy_ok}, latency={sy_latency:.1f}ms")
+        except Exception as e:
+            logger.error(f"Failed to release Sy on stop: {e}")
+        finally:
+            await sy_companion_client.close()
+            sy_companion_client = None
+
 
 async def _run_full_session(
-    slc_client: SpendingLimitClient,
+    slc_client: Optional[SpendingLimitClient],
     chf_handler,
     supi: str,
     gpsi: str,
@@ -2592,102 +2787,126 @@ async def _run_full_session(
     speed_mbps: float,
     session_duration_sec: int,
     num_sessions: int,
+    sy_client: Optional["DiameterSyClient"] = None,
+    companion: str = "en28",
+    event_triggers: Optional[List[dict]] = None,
 ):
-    """Orchestrate the full session lifecycle:
-    1. eN28 Subscribe (spending limit)
+    """Orchestrate the CHF session with an optional companion Spending-Limit leg:
+    1. Companion Subscribe (eN28 Subscribe, or Sy SLR-Initial)
     2. CHF Create → Consume → Updates → Release
-    3. eN28 Unsubscribe
+    3. Companion Unsubscribe (eN28 Unsubscribe, or Sy SLR-Final)
     """
     try:
-        # === PHASE 1: eN28 Subscribe ===
-        logger.info("=" * 60)
-        logger.info("FULL SESSION: Phase 1 — eN28 Subscribe")
-        logger.info("=" * 60)
+        # === PHASE 1: Companion Subscribe ===
+        if companion in ("sy", "esy") and sy_client is not None:
+            logger.info("=" * 60)
+            logger.info(f"FULL SESSION: Phase 1 — Diameter Sy Subscribe (SLR-Initial){' [eSy]' if companion == 'esy' else ''}")
+            logger.info("=" * 60)
+            try:
+                sy_ok, sy_latency = await sy_client.create_session()
+            except Exception as e:
+                logger.error(f"Sy subscribe error: {e}")
+                sy_ok, sy_latency = False, 0.0
+            await broadcast_metrics({
+                "type": "sy_subscribe",
+                "success": sy_ok,
+                "latency_ms": sy_latency,
+                "session_id": sy_client.session_id,
+                "companion": companion,
+                "policy_counter_ids": policy_counter_ids,
+            })
+            if not sy_ok:
+                logger.warning("Sy SLR-Initial failed — continuing with CHF session only (degraded mode)")
 
-        success, latency, initial_status = await slc_client.subscribe(
-            supi=supi,
-            gpsi=gpsi,
-            notif_uri=notif_uri,
-            policy_counter_ids=policy_counter_ids,
-            initial_retrieval=initial_retrieval,
-            enable_en28=enable_en28,
-        )
+        elif companion in ("n28", "en28") and slc_client is not None:
+            logger.info("=" * 60)
+            logger.info("FULL SESSION: Phase 1 — eN28 Subscribe")
+            logger.info("=" * 60)
 
-        # Broadcast subscription result
-        await broadcast_metrics({
-            "type": "en28_subscribe",
-            "success": success,
-            "latency_ms": latency,
-            "subscription_id": slc_client.subscription_id,
-            "initial_status": initial_status,
-        })
+            success, latency, initial_status = await slc_client.subscribe(
+                supi=supi,
+                gpsi=gpsi,
+                notif_uri=notif_uri,
+                policy_counter_ids=policy_counter_ids,
+                initial_retrieval=initial_retrieval,
+                enable_en28=enable_en28,
+            )
 
-        if not success:
-            logger.warning("eN28 Subscribe failed — continuing with CHF session only (degraded mode)")
+            # Broadcast subscription result
+            await broadcast_metrics({
+                "type": "en28_subscribe",
+                "success": success,
+                "latency_ms": latency,
+                "subscription_id": slc_client.subscription_id,
+                "initial_status": initial_status,
+            })
 
-        # If initial status was returned, store as a notification
-        # Handle three formats:
-        #   Standard N28: {"statusInfos": {"counterId": {"policyCounterId": "x", "currentStatus": "y"}}}
-        #   3GPP: {"spendingLimitStatus": {"statusInfoList": [...]}}
-        #   E-N28: {"vendorSpecific-000193": {"policyCounters": [...], "policyGroups": {...}}}
-        if initial_status:
-            status_info_list = []
-            policy_groups = {}
-            policy_counters_en28 = []
+            if not success:
+                logger.warning("eN28 Subscribe failed — continuing with CHF session only (degraded mode)")
 
-            # Try E-N28 format: vendorSpecific-000193 with policyGroups and policyCounters
-            vendor_block = initial_status.get("vendorSpecific-000193")
-            if vendor_block and isinstance(vendor_block, dict):
-                policy_counters_en28 = vendor_block.get("policyCounters", [])
-                policy_groups = vendor_block.get("policyGroups", {})
+            # If initial status was returned, store as a notification
+            # Handle three formats:
+            #   Standard N28: {"statusInfos": {"counterId": {"policyCounterId": "x", "currentStatus": "y"}}}
+            #   3GPP: {"spendingLimitStatus": {"statusInfoList": [...]}}
+            #   E-N28: {"vendorSpecific-000193": {"policyCounters": [...], "policyGroups": {...}}}
+            if initial_status:
+                status_info_list = []
+                policy_groups = {}
+                policy_counters_en28 = []
 
-                for pc in policy_counters_en28:
-                    status_info_list.append({
-                        "policyCounterId": pc.get("policyCounterIdentifier", ""),
-                        "currentStatus": pc.get("policyCounterStatus", "UNKNOWN"),
-                        "policyGroupName": pc.get("policyGroupName", ""),
-                    })
-                logger.info(f"    E-N28 Policy Counters: {policy_counters_en28}")
-                logger.info(f"    E-N28 Policy Groups: {policy_groups}")
+                # Try E-N28 format: vendorSpecific-000193 with policyGroups and policyCounters
+                vendor_block = initial_status.get("vendorSpecific-000193")
+                if vendor_block and isinstance(vendor_block, dict):
+                    policy_counters_en28 = vendor_block.get("policyCounters", [])
+                    policy_groups = vendor_block.get("policyGroups", {})
 
-            # Try Ericsson CHA standard format: {"statusInfos": {"1": {...}, "2": {...}}}
-            elif "statusInfos" in initial_status:
-                status_infos = initial_status["statusInfos"]
-                if isinstance(status_infos, dict):
-                    for counter_id, info in status_infos.items():
+                    for pc in policy_counters_en28:
                         status_info_list.append({
-                            "policyCounterId": info.get("policyCounterId", counter_id),
-                            "currentStatus": info.get("currentStatus", "UNKNOWN"),
+                            "policyCounterId": pc.get("policyCounterIdentifier", ""),
+                            "currentStatus": pc.get("policyCounterStatus", "UNKNOWN"),
+                            "policyGroupName": pc.get("policyGroupName", ""),
                         })
-                    logger.info(f"    Initial counter status (Ericsson format): {status_info_list}")
+                    logger.info(f"    E-N28 Policy Counters: {policy_counters_en28}")
+                    logger.info(f"    E-N28 Policy Groups: {policy_groups}")
 
-            # Try 3GPP standard format: {"spendingLimitStatus": {"statusInfoList": [...]}}
-            elif "spendingLimitStatus" in initial_status:
-                sls = initial_status["spendingLimitStatus"]
-                if isinstance(sls, dict):
-                    status_info_list = sls.get("statusInfoList", [])
-                    logger.info(f"    Initial counter status (3GPP format): {status_info_list}")
+                # Try Ericsson CHA standard format: {"statusInfos": {"1": {...}, "2": {...}}}
+                elif "statusInfos" in initial_status:
+                    status_infos = initial_status["statusInfos"]
+                    if isinstance(status_infos, dict):
+                        for counter_id, info in status_infos.items():
+                            status_info_list.append({
+                                "policyCounterId": info.get("policyCounterId", counter_id),
+                                "currentStatus": info.get("currentStatus", "UNKNOWN"),
+                            })
+                        logger.info(f"    Initial counter status (Ericsson format): {status_info_list}")
 
-            if status_info_list or policy_groups:
-                notification_entry = {
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "body": initial_status,
-                    "supi": supi,
-                    "statusInfoList": status_info_list,
-                    "policyGroups": policy_groups,
-                    "source": "initial_retrieval",
-                }
-                en28_notifications.append(notification_entry)
+                # Try 3GPP standard format: {"spendingLimitStatus": {"statusInfoList": [...]}}
+                elif "spendingLimitStatus" in initial_status:
+                    sls = initial_status["spendingLimitStatus"]
+                    if isinstance(sls, dict):
+                        status_info_list = sls.get("statusInfoList", [])
+                        logger.info(f"    Initial counter status (3GPP format): {status_info_list}")
 
-                # Emit WebSocket event so UI shows it immediately
-                await broadcast_metrics({
-                    "type": "en28_notification",
-                    "source": "initial_retrieval",
-                    "supi": supi,
-                    "statusInfoList": status_info_list,
-                    "policyGroups": policy_groups,
-                    "subscription_id": slc_client.subscription_id,
-                })
+                if status_info_list or policy_groups:
+                    notification_entry = {
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "body": initial_status,
+                        "supi": supi,
+                        "statusInfoList": status_info_list,
+                        "policyGroups": policy_groups,
+                        "source": "initial_retrieval",
+                    }
+                    en28_notifications.append(notification_entry)
+
+                    # Emit WebSocket event so UI shows it immediately
+                    await broadcast_metrics({
+                        "type": "en28_notification",
+                        "source": "initial_retrieval",
+                        "supi": supi,
+                        "statusInfoList": status_info_list,
+                        "policyGroups": policy_groups,
+                        "subscription_id": slc_client.subscription_id,
+                    })
 
         # === PHASE 2: CHF Charging Session ===
         logger.info("=" * 60)
@@ -2701,24 +2920,42 @@ async def _run_full_session(
             rating_groups=rating_groups,
             session_duration_sec=session_duration_sec,
             metrics_callback=broadcast_metrics,
+            event_triggers=event_triggers,
         )
 
         # Wait for the consumption engine to complete
         while consumption_engine._running:
             await asyncio.sleep(1.0)
 
-        # === PHASE 3: eN28 Unsubscribe ===
-        logger.info("=" * 60)
-        logger.info("FULL SESSION: Phase 3 — eN28 Unsubscribe")
-        logger.info("=" * 60)
-
-        if slc_client.is_subscribed:
-            success, latency = await slc_client.unsubscribe()
+        # === PHASE 3: Companion Unsubscribe ===
+        if companion in ("sy", "esy") and sy_client is not None and sy_client.session_id:
+            logger.info("=" * 60)
+            logger.info("FULL SESSION: Phase 3 — Diameter Sy Unsubscribe (SLR-Final)")
+            logger.info("=" * 60)
+            try:
+                sy_ok, sy_latency = await sy_client.release_session()
+            except Exception as e:
+                logger.error(f"Sy unsubscribe error: {e}")
+                sy_ok, sy_latency = False, 0.0
             await broadcast_metrics({
-                "type": "en28_unsubscribe",
-                "success": success,
-                "latency_ms": latency,
+                "type": "sy_unsubscribe",
+                "success": sy_ok,
+                "latency_ms": sy_latency,
+                "companion": companion,
             })
+
+        elif companion in ("n28", "en28") and slc_client is not None:
+            logger.info("=" * 60)
+            logger.info("FULL SESSION: Phase 3 — eN28 Unsubscribe")
+            logger.info("=" * 60)
+
+            if slc_client.is_subscribed:
+                success, latency = await slc_client.unsubscribe()
+                await broadcast_metrics({
+                    "type": "en28_unsubscribe",
+                    "success": success,
+                    "latency_ms": latency,
+                })
 
         logger.info("=" * 60)
         logger.info("FULL SESSION: Complete")
@@ -2726,6 +2963,7 @@ async def _run_full_session(
 
         await broadcast_metrics({
             "type": "full_session_complete",
+            "companion": companion,
             "en28_notifications_received": len(en28_notifications),
         })
 
@@ -2744,7 +2982,10 @@ async def _run_full_session(
         })
     finally:
         await chf_handler.close()
-        await slc_client.close()
+        if slc_client is not None:
+            await slc_client.close()
+        if sy_client is not None:
+            await sy_client.close()
 
 
 # ─── WebSocket for live metrics ───────────────────────────────────────────────
