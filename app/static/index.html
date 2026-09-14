@@ -92,15 +92,22 @@
         }
         .main-grid {
             display: grid;
-            grid-template-columns: minmax(560px, 720px) 1fr;
+            grid-template-columns: 1fr;
             grid-template-rows: 1fr auto;
             gap: 1.2rem;
             padding: 1.2rem;
             max-height: calc(100vh - 110px);
             overflow: hidden;
         }
+        /* Metrics panel only relevant while running Traffic. Hidden otherwise so
+           Integration / Step-by-Step use the full width. */
+        .metrics-panel { display: none; }
+        .main-grid.show-metrics {
+            grid-template-columns: minmax(420px, 560px) 1fr;
+        }
+        .main-grid.show-metrics .metrics-panel { display: block; }
         @media (max-width: 1024px) {
-            .main-grid {
+            .main-grid, .main-grid.show-metrics {
                 grid-template-columns: 1fr;
                 max-height: unset;
                 overflow: auto;
@@ -136,15 +143,6 @@
             color: var(--text-primary);
             font-size: 0.85rem;
         }
-        /* Lay config cards out in responsive columns to reduce vertical scrolling */
-        .tab-content.active {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
-            gap: 1rem;
-            align-content: start;
-        }
-        .tab-content:not(.active) { display: none; }
-        .card { break-inside: avoid; }
         .config-panel::-webkit-scrollbar { width: 6px; }
         .config-panel::-webkit-scrollbar-thumb { background: var(--bg-card); border-radius: 3px; }
         .form-group { margin-bottom: 0.7rem; }
@@ -480,7 +478,7 @@
     </div>
 
 
-    <div class="main-grid">
+    <div class="main-grid" id="mainGrid">
         <!-- CONFIG PANEL -->
         <div class="config-panel">
 
@@ -1174,6 +1172,14 @@
                 document.getElementById('tabIntegration').classList.toggle('active', tab === 'integration');
                 document.getElementById('tabTraffic').classList.toggle('active', tab === 'traffic');
                 document.getElementById('tabManual').classList.toggle('active', tab === 'manual');
+                // Live metrics panel only on the Traffic tab.
+                document.getElementById('mainGrid').classList.toggle('show-metrics', tab === 'traffic');
+                if (tab === 'traffic') {
+                    // Charts were hidden at init; resize so they render at full size.
+                    setTimeout(() => {
+                        try { if (tpsChart) tpsChart.resize(); if (responseChart) responseChart.resize(); } catch (e) {}
+                    }, 50);
+                }
             }
         });
 
