@@ -92,7 +92,7 @@
         }
         .main-grid {
             display: grid;
-            grid-template-columns: 380px 1fr;
+            grid-template-columns: minmax(560px, 720px) 1fr;
             grid-template-rows: 1fr auto;
             gap: 1.2rem;
             padding: 1.2rem;
@@ -126,6 +126,25 @@
             flex-direction: column;
             gap: 1rem;
         }
+        /* Protocol dropdown in header */
+        .protocol-select-wrap { display: flex; align-items: center; }
+        .protocol-select-wrap select {
+            padding: 0.4rem 0.7rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--accent);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.85rem;
+        }
+        /* Lay config cards out in responsive columns to reduce vertical scrolling */
+        .tab-content.active {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+            gap: 1rem;
+            align-content: start;
+        }
+        .tab-content:not(.active) { display: none; }
+        .card { break-inside: avoid; }
         .config-panel::-webkit-scrollbar { width: 6px; }
         .config-panel::-webkit-scrollbar-thumb { background: var(--bg-card); border-radius: 3px; }
         .form-group { margin-bottom: 0.7rem; }
@@ -442,19 +461,21 @@
 <body>
     <header>
         <h1>&#128225; Telecom Traffic Simulator</h1>
-        <div class="protocol-tabs" id="protocolTabs">
-            <button class="active" data-protocol="chf">CHF</button>
-            <button data-protocol="gy">Gy</button>
-            <button data-protocol="ro">Ro</button>
-            <button data-protocol="scapv2">SCAPv2</button>
-            <button data-protocol="full_session" style="border-color: var(--warning); color: var(--warning);">Full Session</button>
+        <div class="protocol-select-wrap">
+            <label for="protocolSelect" style="font-size:0.8rem;color:var(--text-secondary);margin-right:0.4rem;">Protocol</label>
+            <select id="protocolSelect">
+                <option value="chf" selected>CHF (5G Converged Charging)</option>
+                <option value="gy">Gy (Diameter Online Charging)</option>
+                <option value="ro">Ro (Diameter)</option>
+                <option value="scapv2">SCAPv2</option>
+            </select>
         </div>
     </header>
 
-    <!-- Sub-tabs: Integration / Traffic -->
+    <!-- Main tabs: Integration (common) / Traffic / Step-by-Step -->
     <div class="sub-tabs" id="subTabs">
-        <button data-tab="integration">Integration</button>
-        <button class="active" data-tab="traffic">Traffic</button>
+        <button class="active" data-tab="integration">Integration</button>
+        <button data-tab="traffic">Traffic</button>
         <button data-tab="manual" style="border-color:var(--warning);color:var(--warning);">Step-by-Step</button>
     </div>
 
@@ -464,7 +485,7 @@
         <div class="config-panel">
 
             <!-- ═══ INTEGRATION TAB ═══ -->
-            <div class="tab-content" id="tabIntegration">
+            <div class="tab-content active" id="tabIntegration">
                 <div class="card" id="endpointCard">
                     <h3>Endpoint</h3>
                     <div class="form-group">
@@ -625,7 +646,7 @@
             </div>
 
             <!-- ═══ TRAFFIC TAB ═══ -->
-            <div class="tab-content active" id="tabTraffic">
+            <div class="tab-content" id="tabTraffic">
                 <div class="card">
                     <h3>Subscriber</h3>
                     <div class="form-row">
@@ -1157,19 +1178,16 @@
         });
 
         // ─── Protocol Tabs ───────────────────────────────────────────────────────
-        document.getElementById('protocolTabs').addEventListener('click', (e) => {
-            if (e.target.tagName === 'BUTTON') {
-                document.querySelectorAll('.protocol-tabs button').forEach(b => b.classList.remove('active'));
-                e.target.classList.add('active');
-                selectedProtocol = e.target.dataset.protocol;
-                isFullSession = (selectedProtocol === 'full_session');
-                toggleDiameterFields();
-                toggleFullSessionFields();
-                toggle5gFields();
-                loadSavedSettings();
-            onIdTypeChange(); // Load per-protocol saved settings
-                updateDefaultsForProtocol();
-            }
+        // ─── Protocol selector (dropdown in header) ──────────────────────────────
+        document.getElementById('protocolSelect').addEventListener('change', (e) => {
+            selectedProtocol = e.target.value;
+            isFullSession = false;  // Full Session removed; eN28/N28 are companion toggles
+            toggleDiameterFields();
+            toggleFullSessionFields();
+            toggle5gFields();
+            loadSavedSettings();
+            onIdTypeChange();
+            updateDefaultsForProtocol();
         });
 
         function updateDefaultsForProtocol() {
@@ -1180,7 +1198,6 @@
                 'scapv2': { path: '/scapv2/charging/v1', port: '80' },
                 'gy': { path: '', port: '3868' },
                 'ro': { path: '', port: '3868' },
-                'full_session': { path: '/nchf-convergedcharging/v2', port: '80' },
             };
             const d = defaults[selectedProtocol] || defaults['chf'];
             basePathEl.placeholder = d.path;
@@ -1190,10 +1207,10 @@
             if (!portEl.value || ['80', '443', '3868'].includes(portEl.value)) {
                 portEl.value = d.port;
             }
-            // Auto-fill notifUri with current host
-            if (isFullSession) {
+            // Auto-fill notifUri with current host for charging protocols
+            if (['chf', 'gy', 'ro'].includes(selectedProtocol)) {
                 const notifUriEl = document.getElementById('notifUri');
-                if (!notifUriEl.value) {
+                if (notifUriEl && !notifUriEl.value) {
                     notifUriEl.value = `http://${window.location.hostname}:${window.location.port || '8080'}/notifications/spendinglimit`;
                 }
             }
@@ -1203,15 +1220,10 @@
             const fullSessionSection = document.getElementById('fullSessionFields');
             const notifPanel = document.getElementById('notificationPanel');
             // Companion policy (Sy/ESy/N28/eN28) can accompany any charging session.
-            const chargingProtocols = ['chf', 'gy', 'ro', 'full_session'];
+            const chargingProtocols = ['chf', 'gy', 'ro'];
             const show = chargingProtocols.includes(selectedProtocol);
             fullSessionSection.classList.toggle('visible', show);
             notifPanel.classList.toggle('visible', show);
-            // Full Session forces eN28 on by default; others leave it optional.
-            if (isFullSession) {
-                const en28 = document.getElementById('policyEn28');
-                if (en28) en28.checked = true;
-            }
         }
 
         // Hide 5G-only subscriber fields for Diameter (Gy/Ro) which use only
@@ -1563,7 +1575,7 @@
                     addLog('SYS', 'Start', 'error', data.error);
                 } else {
                     setStatus('running');
-                    addLog('eN28', 'Start', 'ok', `Full Session started — eN28 Subscribe + CHF at ${speed} Mbps`);
+                    addLog('eN28', 'Start', 'ok', `Charging + eN28 policy started at ${speed} Mbps`);
                     addLog('eN28', 'Info', 'ok', `Counters: ${policyCounterIds.join(', ')}`);
                     connectWebSocket();
                 }
@@ -2352,17 +2364,14 @@
 
         // ─── Init on load ─────────────────────────────────────────────────────────
         document.addEventListener('DOMContentLoaded', () => {
-            // Restore last selected protocol
-            const lastProto = localStorage.getItem('sim_lastProtocol');
-            if (lastProto) {
-                const btn = document.querySelector(`.protocol-tabs button[data-protocol="${lastProto}"]`);
-                if (btn) {
-                    document.querySelectorAll('.protocol-tabs button').forEach(b => b.classList.remove('active'));
-                    btn.classList.add('active');
-                    selectedProtocol = lastProto;
-                    isFullSession = (selectedProtocol === 'full_session');
-                }
-            }
+            // Restore last selected protocol into the dropdown
+            const validProtocols = ['chf', 'gy', 'ro', 'scapv2'];
+            let lastProto = localStorage.getItem('sim_lastProtocol');
+            if (!validProtocols.includes(lastProto)) lastProto = 'chf';
+            const sel = document.getElementById('protocolSelect');
+            if (sel) sel.value = lastProto;
+            selectedProtocol = lastProto;
+            isFullSession = false;
             loadSavedSettings();
             onIdTypeChange();
             initCharts();
