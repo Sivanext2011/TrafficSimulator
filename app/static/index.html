@@ -444,9 +444,7 @@
         <h1>&#128225; Telecom Traffic Simulator</h1>
         <div class="protocol-tabs" id="protocolTabs">
             <button class="active" data-protocol="chf">CHF</button>
-            <button data-protocol="pcf">PCF</button>
             <button data-protocol="gy">Gy</button>
-            <button data-protocol="sy">Sy</button>
             <button data-protocol="ro">Ro</button>
             <button data-protocol="scapv2">SCAPv2</button>
             <button data-protocol="full_session" style="border-color: var(--warning); color: var(--warning);">Full Session</button>
@@ -554,18 +552,28 @@
                     </div>
                 </div>
 
-                <!-- Full Session (eN28) fields -->
+                <!-- Companion Policy (optional add-ons: Sy / ESy / N28 / eN28) -->
                 <div class="card full-session-fields" id="fullSessionFields">
-                    <h3>eN28 Spending Limit Control</h3>
+                    <h3>Companion Policy (optional)</h3>
                     <div class="form-group">
-                        <label>eN28 Endpoint (leave blank = same as CHF)</label>
+                        <label>Run alongside charging (leave all unchecked for charging-only):</label>
+                        <div style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:0.3rem;">
+                            <label style="font-weight:normal;"><input type="checkbox" id="policySy"> Sy</label>
+                            <label style="font-weight:normal;"><input type="checkbox" id="policyEsy"> ESy</label>
+                            <label style="font-weight:normal;"><input type="checkbox" id="policyN28"> N28</label>
+                            <label style="font-weight:normal;"><input type="checkbox" id="policyEn28" checked> eN28</label>
+                        </div>
+                        <small style="color:var(--text-secondary);font-size:0.72rem;">Sy/ESy are Diameter policy (Spending Limit); N28/eN28 are 5G SBI SpendingLimitControl. eN28 adds the ERICSSON_SLC vendor extension.</small>
+                    </div>
+                    <div class="form-group">
+                        <label>SLC/eN28 Endpoint (leave blank = same as charging endpoint)</label>
                         <div class="form-row">
                             <input type="text" id="en28Fqdn" placeholder="Same as CHF FQDN">
                             <input type="number" id="en28Port" placeholder="Same as CHF port">
                         </div>
                     </div>
                     <div class="form-group">
-                        <label>eN28 Base Path</label>
+                        <label>SLC Base Path</label>
                         <input type="text" id="en28BasePath" value="/nchf-spendinglimitcontrol/v1">
                     </div>
                     <div class="form-group">
@@ -643,7 +651,7 @@
                             <input type="text" id="imsi" placeholder="310260000000001">
                         </div>
                     </div>
-                    <div class="form-row">
+                    <div class="form-row" id="row5gIdType">
                         <div class="form-group">
                             <label>Identifier Type (charging key)</label>
                             <select id="idType" onchange="onIdTypeChange()">
@@ -660,14 +668,14 @@
                             <input type="text" id="idValue" placeholder="depends on identifier type">
                         </div>
                     </div>
-                    <div class="form-row">
+                    <div class="form-row" id="row5gPei">
                         <div class="form-group">
                             <label>PEI (optional)</label>
                             <input type="text" id="pei" placeholder="imeisv-3525566012011313">
                         </div>
                         <div class="form-group"></div>
                     </div>
-                    <div class="form-row-3">
+                    <div class="form-row-3" id="row5gSlice">
                         <div class="form-group">
                             <label>Slice SST</label>
                             <input type="number" id="sliceSST" placeholder="1">
@@ -695,7 +703,7 @@
                             <input type="text" id="mnc" placeholder="260">
                         </div>
                     </div>
-                    <div class="form-row-3">
+                    <div class="form-row-3" id="row5gQos">
                         <div class="form-group">
                             <label>5QI</label>
                             <input type="number" id="qos5qi" placeholder="9">
@@ -1116,8 +1124,8 @@
 
         // Speed steps for logarithmic-feel slider
         const speedSteps = [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
-        const diameterProtocols = ['gy', 'ro', 'sy'];
-        const sbiProtocols = ['chf', 'pcf', 'scapv2'];
+        const diameterProtocols = ['gy', 'ro'];
+        const sbiProtocols = ['chf', 'scapv2'];
 
         // ─── Integration field IDs and their localStorage keys ───────────────────
         // All persistable fields across both tabs
@@ -1157,6 +1165,7 @@
                 isFullSession = (selectedProtocol === 'full_session');
                 toggleDiameterFields();
                 toggleFullSessionFields();
+                toggle5gFields();
                 loadSavedSettings();
             onIdTypeChange(); // Load per-protocol saved settings
                 updateDefaultsForProtocol();
@@ -1168,11 +1177,9 @@
             const portEl = document.getElementById('port');
             const defaults = {
                 'chf': { path: '/nchf-convergedcharging/v2', port: '80' },
-                'pcf': { path: '/npcf-smpolicycontrol/v1', port: '80' },
                 'scapv2': { path: '/scapv2/charging/v1', port: '80' },
                 'gy': { path: '', port: '3868' },
                 'ro': { path: '', port: '3868' },
-                'sy': { path: '', port: '3868' },
                 'full_session': { path: '/nchf-convergedcharging/v2', port: '80' },
             };
             const d = defaults[selectedProtocol] || defaults['chf'];
@@ -1195,13 +1202,29 @@
         function toggleFullSessionFields() {
             const fullSessionSection = document.getElementById('fullSessionFields');
             const notifPanel = document.getElementById('notificationPanel');
+            // Companion policy (Sy/ESy/N28/eN28) can accompany any charging session.
+            const chargingProtocols = ['chf', 'gy', 'ro', 'full_session'];
+            const show = chargingProtocols.includes(selectedProtocol);
+            fullSessionSection.classList.toggle('visible', show);
+            notifPanel.classList.toggle('visible', show);
+            // Full Session forces eN28 on by default; others leave it optional.
             if (isFullSession) {
-                fullSessionSection.classList.add('visible');
-                notifPanel.classList.add('visible');
-            } else {
-                fullSessionSection.classList.remove('visible');
-                notifPanel.classList.remove('visible');
+                const en28 = document.getElementById('policyEn28');
+                if (en28) en28.checked = true;
             }
+        }
+
+        // Hide 5G-only subscriber fields for Diameter (Gy/Ro) which use only
+        // Subscription-Id (MSISDN/IMSI) + rating groups.
+        function toggle5gFields() {
+            const is5g = !diameterProtocols.includes(selectedProtocol);
+            ['archetype', 'row5gIdType', 'row5gPei', 'row5gSlice', 'row5gQos'].forEach(id => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                // archetype is a <select>; wrap its row via closest form-row
+                const target = (id === 'archetype') ? el.closest('.form-row') : el;
+                if (target) target.style.display = is5g ? '' : 'none';
+            });
         }
 
         function toggleDiameterFields() {
@@ -1405,6 +1428,21 @@
             if (isFullSession) {
                 startFullSession(speed, ratingGroups);
                 return;
+            }
+
+            // Companion policy: if eN28/N28 is selected on a CHF charging run, use the
+            // combined full-session flow (SLC subscribe -> charge -> unsubscribe).
+            const wantEn28 = (document.getElementById('policyEn28') || {}).checked;
+            const wantN28  = (document.getElementById('policyN28') || {}).checked;
+            const wantSy   = (document.getElementById('policySy') || {}).checked;
+            const wantEsy  = (document.getElementById('policyEsy') || {}).checked;
+            if (selectedProtocol === 'chf' && (wantEn28 || wantN28)) {
+                startFullSession(speed, ratingGroups);
+                return;
+            }
+            if (wantSy || wantEsy) {
+                addLog('SYS', 'Policy', 'error',
+                    'Sy/ESy companion policy is not yet wired to run in parallel — running charging only. Use the Gy/Ro tab for Diameter, or eN28/N28 for 5G policy.');
             }
 
             const config = {
@@ -2330,6 +2368,7 @@
             initCharts();
             toggleDiameterFields();
             toggleFullSessionFields();
+            toggle5gFields();
             refreshChfDiag();
             setInterval(refreshChfDiag, 5000);
             updateDefaultsForProtocol();
