@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import shutil
 import time
 from contextlib import asynccontextmanager
@@ -166,6 +167,11 @@ CHF_DIAG = ChfDiagnostics()
 
 # eN28 notification storage
 en28_notifications: List[dict] = []
+# N40 (Nchf_ConvergedCharging) CHF-initiated notification storage. The CHF POSTs
+# ChargingNotifyRequest (re-authorization / trigger reporting) to the notifyUri
+# we advertise; when the user leaves notifyUri blank we point it at our own
+# local listener (see /notifications/chf/convergedcharging).
+n40_notifications: List[dict] = []
 en28_spending_limit_client: Optional[SpendingLimitClient] = None
 sy_companion_client: Optional["DiameterSyClient"] = None
 full_session_task: Optional[asyncio.Task] = None
@@ -367,11 +373,10 @@ class ChfSessionHandler:
             # re-arms triggers on an Update when this NEGOTIATED value changes,
             # so the simulator can drive that by sending a different value later.
             "supportedFeatures": str(sub.get("supported_features", "0")),
-            # Real SMF sends the notification callback URI for CHF-initiated reporting
-            "notifyUri": sub.get(
-                "notify_uri",
-                f"http://{sub.get('nf_ip', '192.168.0.1')}:9090/notifications/chf/convergedcharging/v2/referenceid/{charging_id}",
-            ),
+            # Real SMF sends the notification callback URI for CHF-initiated reporting.
+            # Use the user-provided notify_uri when set; otherwise auto-generate one.
+            "notifyUri": (sub.get("notify_uri") or "").strip()
+            or f"http://{sub.get('nf_ip', '192.168.0.1')}:9090/notifications/chf/convergedcharging/v2/referenceid/{charging_id}",
             "multipleUnitUsage": [
                 {
                     "ratingGroup": rg,
@@ -1164,6 +1169,10 @@ class SubscriberConfig(BaseModel):
     apn: str = "internet"
     mcc: str = "466"
     mnc: str = "01"
+    # Optional user-provided CHF notifyUri. When blank/None the simulator
+    # auto-generates a per-session default (see notify_uri usage in the CHF
+    # ChargingData payloads).
+    notify_uri: Optional[str] = None
 
 
 class TrafficConfig(BaseModel):
@@ -1217,6 +1226,32 @@ SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 # (peer host/port, realms, service-context, auth-app-id, subscriber, etc.), unlike
 # settings.json which only holds whatever the UI explicitly chooses to save.
 LAST_TRAFFIC_FILE = SETTINGS_DIR / "last_traffic.json"
+
+# User-configurable "advertised" base URL that the simulator puts into notifyUri /
+# notif_uri when the user does not supply one explicitly. This MUST be an address
+# a remote NF (CHF) can actually route to — never localhost. Persisted so it
+# survives restarts. Managed via GET/POST /api/notify-host.
+NOTIFY_HOST_FILE = SETTINGS_DIR / "notify_host.json"
+
+
+def _load_advertised_base_url() -> Optional[str]:
+    """Load the user-configured advertised base URL, or None if unset."""
+    if NOTIFY_HOST_FILE.exists():
+        try:
+            data = json.loads(NOTIFY_HOST_FILE.read_text(encoding="utf-8"))
+            val = (data.get("base_url") or "").strip()
+            return val or None
+        except (json.JSONDecodeError, IOError):
+            return None
+    return None
+
+
+def _save_advertised_base_url(base_url: Optional[str]) -> None:
+    """Persist (or clear) the user-configured advertised base URL."""
+    NOTIFY_HOST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    NOTIFY_HOST_FILE.write_text(
+        json.dumps({"base_url": (base_url or "").strip()}, indent=2), encoding="utf-8"
+    )
 
 
 def _save_last_traffic_config(config) -> None:
@@ -1374,7 +1409,7 @@ async def list_cert_profiles():
 
 
 @app.post("/api/traffic/start")
-async def start_traffic(config: TrafficConfig):
+async def start_traffic(config: TrafficConfig, request: Request = None):
     try:
         protocol_name = config.protocol.lower()
         sbi_protocols = {"chf", "pcf", "scapv2"}
@@ -1411,7 +1446,7 @@ async def start_traffic(config: TrafficConfig):
                     cert_path=cert_path,
                     key_path=key_path,
                     ca_path=ca_path,
-                    subscriber=config.subscriber.model_dump(),
+                    subscriber=apply_default_notify_uri(config.subscriber.model_dump(), request),
                     secure=config.endpoint.secure,
                     verify_ssl=config.endpoint.verify_ssl,
                 )
@@ -1435,7 +1470,7 @@ async def start_traffic(config: TrafficConfig):
                     cert_path=cert_path,
                     key_path=key_path,
                     ca_path=ca_path,
-                    subscriber=config.subscriber.model_dump(),
+                    subscriber=apply_default_notify_uri(config.subscriber.model_dump(), request),
                     secure=config.endpoint.secure,
                     verify_ssl=config.endpoint.verify_ssl,
                 )
@@ -1844,7 +1879,7 @@ class ManualSessionRelease(BaseModel):
 
 
 @app.post("/api/manual/create")
-async def manual_create_session(config: ManualSessionCreate):
+async def manual_create_session(config: ManualSessionCreate, request: Request = None):
     """Step 1: Send Initial/Create request. Returns full response with granted units/policy."""
     try:
         protocol_name = config.protocol.lower()
@@ -1867,7 +1902,7 @@ async def manual_create_session(config: ManualSessionCreate):
             handler = ChfSessionHandler(
                 fqdn=fqdn, port=config.port, base_path=base_path,
                 cert_path=cert_path, key_path=key_path, ca_path=None,
-                subscriber=config.subscriber.model_dump(),
+                subscriber=apply_default_notify_uri(config.subscriber.model_dump(), request),
                 secure=config.secure, verify_ssl=config.verify_ssl,
             )
         elif protocol_name == "pcf":
@@ -2395,6 +2430,218 @@ async def get_en28_notifications():
     return {"notifications": en28_notifications}
 
 
+# ─── Notify-URI host resolution + N40 CHF notification listener ────────────────
+
+SERVED_PORT = os.environ.get("SIM_PORT") or os.environ.get("PORT") or "8080"
+
+
+def _is_loopback_host(host: str) -> bool:
+    h = (host or "").lower()
+    return h in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or h.startswith("127.")
+
+
+def detect_lan_ip() -> Optional[str]:
+    """Best-effort detection of this machine's outbound-facing LAN IPv4.
+
+    Opens a UDP socket toward a public address (no packets are actually sent)
+    and reads back the local address the OS would use to route out. Returns None
+    if it cannot determine a non-loopback address.
+    """
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        if ip and not _is_loopback_host(ip):
+            return ip
+    except Exception:
+        pass
+    # Fallback: resolve the hostname
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip and not _is_loopback_host(ip):
+            return ip
+    except Exception:
+        pass
+    return None
+
+
+def resolve_notify_base(request: Optional[Request] = None) -> tuple[str, str, Optional[str]]:
+    """Resolve the base URL to advertise to a remote NF for notifications.
+
+    Returns (base_url, source, warning) where:
+      - base_url : scheme://host[:port] with NO trailing slash
+      - source   : how it was derived ("user", "env", "lan", "request", "loopback")
+      - warning  : a human-readable caveat if the address is likely NOT reachable
+                   by a remote NF (e.g. we could only fall back to loopback), else None
+
+    Priority:
+      1. User-configured advertised base URL (POST /api/notify-host).
+      2. SIM_PUBLIC_BASE_URL env var.
+      3. Auto-detected LAN IP + served port.
+      4. Request Host header, but ONLY if it is not loopback.
+      5. Loopback fallback (with a warning — a remote CHF cannot reach this).
+    """
+    # 1. Explicit user configuration
+    user = _load_advertised_base_url()
+    if user:
+        return user.rstrip("/"), "user", None
+
+    # 2. Env override (deployment / proxy)
+    env = os.environ.get("SIM_PUBLIC_BASE_URL")
+    if env:
+        return env.rstrip("/"), "env", None
+
+    # 3. Auto-detected LAN IP
+    lan_ip = detect_lan_ip()
+    if lan_ip:
+        return f"http://{lan_ip}:{SERVED_PORT}", "lan", None
+
+    # 4. Request Host header, only if routable (not loopback)
+    if request is not None:
+        try:
+            host = (request.url.hostname or "")
+            if host and not _is_loopback_host(host):
+                base = str(request.base_url).rstrip("/")
+                if base:
+                    return base, "request", None
+        except Exception:
+            pass
+
+    # 5. Loopback fallback — flag that a remote NF cannot reach this.
+    warning = (
+        "Could not determine a routable host address for notifications. Falling back "
+        f"to http://127.0.0.1:{SERVED_PORT}, which a REMOTE CHF cannot reach. Configure "
+        "an advertised host/base URL (POST /api/notify-host or the UI field) so the CHF "
+        "can send notifications back to this simulator."
+    )
+    return f"http://127.0.0.1:{SERVED_PORT}", "loopback", warning
+
+
+def running_host_base_url(request: Optional[Request] = None) -> str:
+    """Return only the resolved base URL (see resolve_notify_base for details)."""
+    base, _source, warning = resolve_notify_base(request)
+    if warning:
+        logger.warning(warning)
+    return base
+
+
+def default_chf_notify_uri(request: Optional[Request] = None, reference_id: Optional[str] = None) -> str:
+    """Auto-generated N40 notifyUri pointing at our own CHF listener."""
+    ref = reference_id or str(random.randint(1000000000, 9999999999))
+    return f"{running_host_base_url(request)}/notifications/chf/convergedcharging/v2/referenceid/{ref}"
+
+
+def default_en28_notif_uri(request: Optional[Request] = None) -> str:
+    """Auto-generated eN28/N28 notif_uri pointing at our own SLC listener."""
+    return f"{running_host_base_url(request)}/notifications/spendinglimit"
+
+
+def apply_default_notify_uri(subscriber: dict, request: Optional[Request] = None) -> dict:
+    """Ensure the subscriber dict carries a usable N40 notify_uri.
+
+    If the user left notify_uri blank, point it at our own CHF listener on a
+    routable host address so CHF-initiated notifications actually reach us.
+    """
+    existing = (subscriber.get("notify_uri") or "").strip()
+    if not existing:
+        subscriber["notify_uri"] = default_chf_notify_uri(request)
+    return subscriber
+
+
+class NotifyHostConfig(BaseModel):
+    # The advertised base URL (e.g. "http://10.20.30.40:8080"). Empty string clears it.
+    base_url: str = ""
+
+
+@app.get("/api/notify-host")
+async def get_notify_host(request: Request):
+    """Report the currently advertised notification host and how it was derived.
+
+    Lets the UI show the user what CHF will be told, and prompt them to configure
+    an explicit address when we can only fall back to loopback.
+    """
+    configured = _load_advertised_base_url()
+    base, source, warning = resolve_notify_base(request)
+    return {
+        "configured_base_url": configured or "",
+        "effective_base_url": base,
+        "source": source,                       # user | env | lan | request | loopback
+        "reachable": source not in ("loopback",),
+        "warning": warning,
+        "detected_lan_ip": detect_lan_ip(),
+        "served_port": SERVED_PORT,
+        "example_chf_notify_uri": f"{base}/notifications/chf/convergedcharging/v2/referenceid/<id>",
+        "example_en28_notif_uri": f"{base}/notifications/spendinglimit",
+    }
+
+
+@app.post("/api/notify-host")
+async def set_notify_host(cfg: NotifyHostConfig, request: Request):
+    """Set (or clear) the advertised base URL used in notify URIs.
+
+    Pass an empty base_url to clear and revert to auto-detection. A non-empty
+    value must include a scheme (http:// or https://).
+    """
+    val = (cfg.base_url or "").strip().rstrip("/")
+    if val and not (val.startswith("http://") or val.startswith("https://")):
+        return {"error": "base_url must start with http:// or https://"}
+    _save_advertised_base_url(val)
+    base, source, warning = resolve_notify_base(request)
+    return {
+        "status": "saved",
+        "configured_base_url": val,
+        "effective_base_url": base,
+        "source": source,
+        "reachable": source not in ("loopback",),
+        "warning": warning,
+    }
+
+
+@app.post("/notifications/chf/convergedcharging/v2/referenceid/{reference_id}")
+@app.post("/notifications/chf/convergedcharging/v3/referenceid/{reference_id}")
+@app.post("/notifications/chf/convergedcharging")
+async def n40_notification_callback(request: Request, reference_id: str = ""):
+    """Receive N40 CHF-initiated ChargingNotify requests (re-authorization /
+    trigger reporting). This is the real local listener advertised as notifyUri
+    when the user does not provide one."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    notification = {
+        "timestamp": timestamp,
+        "reference_id": reference_id,
+        "notify_type": body.get("notifyType", ""),
+        "body": body,
+    }
+    n40_notifications.append(notification)
+    if len(n40_notifications) > 100:
+        n40_notifications.pop(0)
+
+    logger.info(
+        f"<<< N40 CHF NOTIFICATION RECEIVED: type={notification['notify_type'] or 'n/a'} "
+        f"ref={reference_id or 'n/a'}"
+    )
+
+    await broadcast_metrics({
+        "type": "n40_notification",
+        "notification": notification,
+    })
+    return Response(status_code=204)
+
+
+@app.get("/api/n40/notifications")
+async def get_n40_notifications():
+    """Get all received N40 CHF-initiated notifications."""
+    return {"notifications": n40_notifications}
+
+
 # ─── SLC (Nchf_SpendingLimitControl) first-class flow (feature #13) ────────────
 class SlcSubscribe(BaseModel):
     fqdn: str
@@ -2411,7 +2658,7 @@ class SlcSubscribe(BaseModel):
 
 
 @app.post("/api/slc/subscribe")
-async def slc_subscribe(cfg: SlcSubscribe):
+async def slc_subscribe(cfg: SlcSubscribe, request: Request = None):
     """SLC subscribe: POST /nchf-spendinglimitcontrol/v1/subscriptions. Stores
     the subscription so it can be unsubscribed later. Notifications arrive at
     /notifications/spendinglimit (view via GET /api/en28/notifications)."""
@@ -2426,7 +2673,9 @@ async def slc_subscribe(cfg: SlcSubscribe):
         fqdn=fqdn, port=cfg.port, base_path=cfg.base_path,
         secure=cfg.secure, verify_ssl=cfg.verify_ssl,
     )
-    notif_uri = cfg.notif_uri or "http://127.0.0.1:8080/notifications/spendinglimit"
+    # User-optional notif_uri. When blank, advertise our own live listener on the
+    # running host so CHF can actually POST notifications back to us.
+    notif_uri = (cfg.notif_uri or "").strip() or default_en28_notif_uri(request)
     success, latency_ms, resp = await client.subscribe(
         supi=cfg.supi, gpsi=cfg.gpsi, notif_uri=notif_uri,
         policy_counter_ids=cfg.policy_counter_ids,
@@ -2535,7 +2784,7 @@ class FullSessionConfig(BaseModel):
 
 
 @app.post("/api/traffic/start-full")
-async def start_full_session(config: FullSessionConfig):
+async def start_full_session(config: FullSessionConfig, request: Request = None):
     """Start a CHF session with an optional companion Spending-Limit leg.
 
     companion = none  -> CHF only
@@ -2590,7 +2839,7 @@ async def start_full_session(config: FullSessionConfig):
             cert_path=cert_path,
             key_path=key_path,
             ca_path=None,
-            subscriber=config.subscriber.model_dump(),
+            subscriber=apply_default_notify_uri(config.subscriber.model_dump(), request),
             secure=config.chf_secure,
             verify_ssl=False,
         )
@@ -2602,7 +2851,12 @@ async def start_full_session(config: FullSessionConfig):
 
         # ─── Build the companion client based on selection ────────────────────
         companion_endpoint = None
-        notif_uri = config.notif_uri
+        notif_uri = (config.notif_uri or "").strip()
+        # If the user did not provide a reachable notif_uri (blank or the default
+        # localhost placeholder), point it at our own live listener on the running
+        # host so CHF-initiated eN28 notifications actually reach us.
+        if (not notif_uri) or ("localhost" in notif_uri) or ("127.0.0.1" in notif_uri):
+            notif_uri = default_en28_notif_uri(request)
         notif_uri_warning = None
 
         if companion in ("n28", "en28"):

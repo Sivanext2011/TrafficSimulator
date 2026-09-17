@@ -223,10 +223,8 @@ class ChfProtocol(BaseProtocol):
             "nfConsumerIdentification": self._build_nf_consumer_identification(),
             "invocationTimeStamp": self._session_start_time,
             "invocationSequenceNumber": self._invocation_sequence_number,
-            "notifyUri": self.subscriber.get(
-                "notify_uri",
-                f"http://{self.subscriber.get('smf_ip', '192.168.0.1')}:9090/notifications/chf/convergedcharging/v3/referenceid/{random.randint(1000000000, 9999999999)}",
-            ),
+            "notifyUri": (self.subscriber.get("notify_uri") or "").strip()
+            or f"http://{self.subscriber.get('smf_ip', '192.168.0.1')}:9090/notifications/chf/convergedcharging/v3/referenceid/{random.randint(1000000000, 9999999999)}",
             "pDUSessionChargingInformation": self._build_pdu_session_charging_info(include_start_time=True),
         }
 
@@ -305,10 +303,8 @@ class ChfProtocol(BaseProtocol):
             "nfConsumerIdentification": self._build_nf_consumer_identification(),
             "invocationTimeStamp": current_time,
             "invocationSequenceNumber": self._invocation_sequence_number,
-            "notifyUri": self.subscriber.get(
-                "notify_uri",
-                f"http://{self.subscriber.get('smf_ip', '192.168.0.1')}:9090/notifications/chf/convergedcharging/v3/referenceid/{random.randint(1000000000, 9999999999)}",
-            ),
+            "notifyUri": (self.subscriber.get("notify_uri") or "").strip()
+            or f"http://{self.subscriber.get('smf_ip', '192.168.0.1')}:9090/notifications/chf/convergedcharging/v3/referenceid/{random.randint(1000000000, 9999999999)}",
             "multipleUnitUsage": [multiple_unit_usage_entry],
             "pDUSessionChargingInformation": self._build_pdu_session_charging_info(),
         }

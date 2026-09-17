@@ -464,6 +464,23 @@
 
             <!-- ═══ INTEGRATION TAB ═══ -->
             <div class="tab-content" id="tabIntegration">
+                <div class="card" id="notifyHostCard">
+                    <h3>Notification Host (how CHF reaches this simulator)</h3>
+                    <div class="form-group">
+                        <label>Advertised Base URL (optional)</label>
+                        <input type="text" id="notifyHostBaseUrl" placeholder="e.g. http://10.20.30.40:8080 (leave blank to auto-detect)">
+                        <small style="color:var(--text-secondary);font-size:0.72rem;">
+                            Used to build the notifyUri / notif_uri sent to CHF when you don't
+                            provide one. Must be an address the CHF can route to — NOT localhost.
+                            Leave blank to auto-detect this host's LAN IP.
+                        </small>
+                    </div>
+                    <div class="form-row">
+                        <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.75rem;padding:0.35rem 0.7rem;" onclick="saveNotifyHost()">Save</button>
+                        <button class="btn" style="background:var(--bg-card);color:var(--text-secondary);font-size:0.75rem;padding:0.35rem 0.7rem;" onclick="clearNotifyHost()">Auto-detect</button>
+                    </div>
+                    <div id="notifyHostStatus" style="margin-top:0.5rem;font-size:0.75rem;"></div>
+                </div>
                 <div class="card" id="endpointCard">
                     <h3>Endpoint</h3>
                     <div class="form-group sbi-only">
@@ -721,7 +738,9 @@
                             <label>PEI (optional)</label>
                             <input type="text" id="pei" placeholder="imeisv-3525566012011313">
                         </div>
-                        <div class="form-group"></div>
+                        <div class="form-group">
+                            <label>CHF Notify URI (optional)</label>
+                            <input type="text" id="chfNotifyUri" placeholder="blank = auto (uses Notification Host / LAN IP, never localhost)">                        </div>
                     </div>
                     <div class="form-row-3">
                         <div class="form-group">
@@ -1192,7 +1211,7 @@
             'syFqdn', 'syPort', 'syBasePath', 'sySecure',
             'syOriginHost', 'syOriginRealm', 'syDestHost', 'syDestRealm',
             // Subscriber fields
-            'msisdn', 'imsi', 'sliceSST', 'sliceSD', 'dnn', 'apn', 'mcc', 'mnc',
+            'msisdn', 'imsi', 'sliceSST', 'sliceSD', 'dnn', 'apn', 'mcc', 'mnc', 'chfNotifyUri',
             // Traffic fields
             'ratingGroups', 'sessionDuration', 'numSessions', 'speedSlider',
         ];
@@ -1241,13 +1260,10 @@
             if (!portEl.value || ['80', '443', '3868'].includes(portEl.value)) {
                 portEl.value = d.port;
             }
-            // Auto-fill notifUri with current host when CHF is selected
-            if (selectedProtocol === 'chf') {
-                const notifUriEl = document.getElementById('notifUri');
-                if (notifUriEl && !notifUriEl.value) {
-                    notifUriEl.value = `http://${window.location.hostname}:${window.location.port || '8080'}/notifications/spendinglimit`;
-                }
-            }
+            // Notify URI is left blank by default: the backend resolves a routable
+            // host (LAN IP or the configured Notification Host) so CHF can reach us.
+            // Pre-filling window.location.hostname would inject "localhost", which a
+            // remote CHF cannot route to.
         }
 
         function toggleFullSessionFields() {
@@ -1311,13 +1327,10 @@
             const notifPanel = document.getElementById('notificationPanel');
             if (notifPanel) notifPanel.classList.toggle('visible', isN28);
 
-            // Auto-fill notifUri for N28/eN28
-            if (isN28) {
-                const notifUriEl = document.getElementById('notifUri');
-                if (notifUriEl && !notifUriEl.value) {
-                    notifUriEl.value = `http://${window.location.hostname}:${window.location.port || '8080'}/notifications/spendinglimit`;
-                }
-            }
+            // Notify URI is left blank by default so the backend can advertise a
+            // routable host (LAN IP or the configured Notification Host). Do NOT
+            // pre-fill window.location.hostname — that injects an unreachable
+            // "localhost" for a remote CHF.
         }
 
         function toggleDiameterFields() {
@@ -1559,7 +1572,8 @@
                     dnn: document.getElementById('dnn').value || 'internet',
                     apn: document.getElementById('apn').value || 'internet',
                     mcc: document.getElementById('mcc').value || '466',
-                    mnc: document.getElementById('mnc').value || '01'
+                    mnc: document.getElementById('mnc').value || '01',
+                    notify_uri: (document.getElementById('chfNotifyUri').value || '').trim() || undefined
                 },
                 speed_mbps: speed,
                 rating_groups: ratingGroups,
@@ -1646,7 +1660,8 @@
                     dnn: document.getElementById('dnn').value || 'internet',
                     apn: document.getElementById('apn').value || 'internet',
                     mcc: document.getElementById('mcc').value || '466',
-                    mnc: document.getElementById('mnc').value || '01'
+                    mnc: document.getElementById('mnc').value || '01',
+                    notify_uri: (document.getElementById('chfNotifyUri').value || '').trim() || undefined
                 },
                 policy_counter_ids: policyCounterIds,
                 initial_retrieval: document.getElementById('initialRetrieval').checked,
@@ -2049,7 +2064,8 @@
                     dnn: document.getElementById('dnn').value || 'internet',
                     apn: document.getElementById('apn').value || 'internet',
                     mcc: document.getElementById('mcc').value || '466',
-                    mnc: document.getElementById('mnc').value || '01'
+                    mnc: document.getElementById('mnc').value || '01',
+                    notify_uri: (document.getElementById('chfNotifyUri').value || '').trim() || undefined
                 },
                 rating_groups: ratingGroups,
             };
@@ -2479,6 +2495,62 @@
             });
         }
 
+        // ─── Notification Host (advertised notifyUri / notif_uri) ─────────────────
+        function renderNotifyHostStatus(d) {
+            const el = document.getElementById('notifyHostStatus');
+            if (!el) return;
+            if (!d || d.error) {
+                el.innerHTML = `<span style="color:var(--error);">${(d && d.error) || 'Could not load notification host status'}</span>`;
+                return;
+            }
+            const color = d.reachable ? 'var(--success)' : 'var(--error)';
+            const label = d.reachable ? 'reachable' : 'NOT reachable by remote CHF';
+            let html = `Effective: <b style="color:${color};">${d.effective_base_url}</b> `
+                     + `<span style="color:var(--text-secondary);">(${d.source}, ${label})</span>`;
+            if (d.detected_lan_ip) {
+                html += `<br><span style="color:var(--text-secondary);">Detected LAN IP: ${d.detected_lan_ip}</span>`;
+            }
+            if (d.warning) {
+                html += `<br><span style="color:var(--error);">${d.warning}</span>`;
+            }
+            el.innerHTML = html;
+        }
+
+        function loadNotifyHost() {
+            fetch('/api/notify-host')
+                .then(r => r.json())
+                .then(d => {
+                    const inp = document.getElementById('notifyHostBaseUrl');
+                    if (inp && d.configured_base_url) inp.value = d.configured_base_url;
+                    renderNotifyHostStatus(d);
+                })
+                .catch(e => renderNotifyHostStatus({ error: String(e) }));
+        }
+
+        function saveNotifyHost() {
+            const base = (document.getElementById('notifyHostBaseUrl').value || '').trim();
+            fetch('/api/notify-host', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ base_url: base })
+            })
+            .then(r => r.json())
+            .then(d => renderNotifyHostStatus(d))
+            .catch(e => renderNotifyHostStatus({ error: String(e) }));
+        }
+
+        function clearNotifyHost() {
+            document.getElementById('notifyHostBaseUrl').value = '';
+            fetch('/api/notify-host', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ base_url: '' })
+            })
+            .then(r => r.json())
+            .then(d => renderNotifyHostStatus(d))
+            .catch(e => renderNotifyHostStatus({ error: String(e) }));
+        }
+
         // ─── Init on load ─────────────────────────────────────────────────────────
         document.addEventListener('DOMContentLoaded', () => {
             const validProtocols = ['chf', 'gy', 'scapv2', 'ro'];
@@ -2499,6 +2571,7 @@
             refreshChfDiag();
             setInterval(refreshChfDiag, 5000);
             updateDefaultsForProtocol();
+            loadNotifyHost();
         });
     </script>
 </body>
